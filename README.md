@@ -1,6 +1,6 @@
 # Hyprsession
 ## Overview
-Hyprland 0.57-compatible fork of [mjgreenjr/hyprsession](https://github.com/mjgreenjr/hyprsession), retaining its [fork baseline](https://github.com/mjgreenjr/hyprsession/commit/7b31b3a5e8be42a211eedd75fcbbd73d99d519f0) and the history of the original [joshurtree/hyprsession](https://github.com/joshurtree/hyprsession). It works through Hyprland IPC without the HyprToroid plugin. GPL-3.0; upstream credits and license are retained.
+Hyprland 0.57-compatible fork of [joshurtree/hyprsession](https://github.com/joshurtree/hyprsession), incorporating the [mjgreenjr/hyprsession fork baseline](https://github.com/mjgreenjr/hyprsession/commit/7b31b3a5e8be42a211eedd75fcbbd73d99d519f0). Both upstream histories are retained. It works through Hyprland IPC without the HyprToroid plugin. GPL-3.0; upstream credits and license are retained.
 
 The authoritative snapshot is `clients.json`: modern workspace addresses/types, recorded argv, working directories and window state. GUI applications are not restricted to an allowlist. Launches use recorded argv or a matching desktop entry when the executable is unavailable. This relaunches applications, not live process memory.
 Compositor previews/update dialogs are excluded as infrastructure. Ordinary GUI windows remain eligible. Noctalia Settings uses its supported `noctalia msg settings-open` activation: rerunning its shell process alone does not recreate that window.
@@ -20,7 +20,7 @@ An up-to-date Rust/Cargo toolchain is required. The HyprToroid Arch package buil
 In HyprToroid UWSM profiles, `HYPRTOROID_UWSM=1` switches the final logout action to `uwsm stop`, after the same save/freeze sequence. A failed stop remains an error and leaves the snapshot frozen. Profiles without this flag retain native Hyprland exit.
 
 
-This independent fork is maintained at [Nie1iX/hyprsession](https://github.com/Nie1iX/hyprsession). [HyprToroid](https://github.com/Nie1iX/hyprtoroid) packages it as a separate executable at a pinned source revision, with an optional `HYPRSESSION_SOURCE_DIR` override for local development. Only that integration sets the snapshot path above and `HYPRTOROID_UWSM`; standalone use retains the CLI's defaults. Upstream compatibility work can be checked manually at [PR #19](https://github.com/joshurtree/hyprsession/pull/19) and [issue #20](https://github.com/joshurtree/hyprsession/issues/20).
+This repository is a GitHub fork of the original upstream, maintained at [Nie1iX/hyprsession](https://github.com/Nie1iX/hyprsession). [HyprToroid](https://github.com/Nie1iX/HyprToroid) packages it as a separate executable at a pinned source revision, with an optional `HYPRSESSION_SOURCE_DIR` override for local development. Only that integration sets the snapshot path above and `HYPRTOROID_UWSM`; standalone use retains the CLI's defaults. Upstream compatibility work can be checked manually at [PR #19](https://github.com/joshurtree/hyprsession/pull/19) and [issue #20](https://github.com/joshurtree/hyprsession/issues/20).
 
 ## Options
 Various options can be used to modify the behavior of Hyprsession.
@@ -183,7 +183,7 @@ A file named `disabled` in `HYPRSESSION_PATH` disables restore/autosave.
 
 ## Change log
 ### Unreleased
-* Publish the independent fork with upstream attribution; remove obsolete release automation and the broken inherited VM harness
+* Publish as a GitHub fork of the original upstream, retaining history and credits; remove obsolete release automation and the broken inherited VM harness
 * Run CLI and library code from the same modules; keep isolated behavior tests and remove test-only implementation copies and host-dependent launcher tests
 * Merge startup with unrelated autostart windows; explicit non-destructive `load --merge` recovery in the same compositor, process-bound reuse and shared-workspace tiled geometry checks
 * Bind successful startup authorization to the snapshot name; keep disabled existing snapshots protected
