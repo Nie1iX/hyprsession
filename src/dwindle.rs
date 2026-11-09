@@ -66,26 +66,58 @@ pub fn reconstruct(items: &[(usize, Rect)], tol: f64) -> Option<Tree> {
     }
     let x0 = items.iter().map(|i| i.1 .0).fold(f64::INFINITY, f64::min);
     let y0 = items.iter().map(|i| i.1 .1).fold(f64::INFINITY, f64::min);
-    let x1 = items.iter().map(|i| i.1 .2).fold(f64::NEG_INFINITY, f64::max);
-    let y1 = items.iter().map(|i| i.1 .3).fold(f64::NEG_INFINITY, f64::max);
-    let prefer = if (x1 - x0) > (y1 - y0) { Orient::V } else { Orient::H };
-    let other = if prefer == Orient::V { Orient::H } else { Orient::V };
+    let x1 = items
+        .iter()
+        .map(|i| i.1 .2)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let y1 = items
+        .iter()
+        .map(|i| i.1 .3)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let prefer = if (x1 - x0) > (y1 - y0) {
+        Orient::V
+    } else {
+        Orient::H
+    };
+    let other = if prefer == Orient::V {
+        Orient::H
+    } else {
+        Orient::V
+    };
     for orient in [prefer, other] {
-        let side = |r: &Rect| if orient == Orient::V { (r.0, r.2) } else { (r.1, r.3) };
+        let side = |r: &Rect| {
+            if orient == Orient::V {
+                (r.0, r.2)
+            } else {
+                (r.1, r.3)
+            }
+        };
         let mut order: Vec<(usize, Rect)> = items.to_vec();
         order.sort_by(|a, b| {
             let (al, ah) = side(&a.1);
             let (bl, bh) = side(&b.1);
-            al.partial_cmp(&bl).unwrap().then(ah.partial_cmp(&bh).unwrap())
+            al.partial_cmp(&bl)
+                .unwrap()
+                .then(ah.partial_cmp(&bh).unwrap())
         });
-        let centre = if orient == Orient::V { (x0 + x1) / 2.0 } else { (y0 + y1) / 2.0 };
+        let centre = if orient == Orient::V {
+            (x0 + x1) / 2.0
+        } else {
+            (y0 + y1) / 2.0
+        };
         let mut best: Option<(f64, usize)> = None;
         for i in 1..order.len() {
-            let end = order[..i].iter().map(|it| side(&it.1).1).fold(f64::NEG_INFINITY, f64::max);
-            let start = order[i..].iter().map(|it| side(&it.1).0).fold(f64::INFINITY, f64::min);
+            let end = order[..i]
+                .iter()
+                .map(|it| side(&it.1).1)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let start = order[i..]
+                .iter()
+                .map(|it| side(&it.1).0)
+                .fold(f64::INFINITY, f64::min);
             if end <= start + tol {
                 let score = (((end + start) / 2.0) - centre).abs();
-                if best.map_or(true, |(s, _)| score < s) {
+                if best.is_none_or(|(s, _)| score < s) {
                     best = Some((score, i));
                 }
             }
@@ -107,7 +139,9 @@ enum Node {
 fn freeze(nodes: &[Node], at: usize) -> Tree {
     match &nodes[at] {
         Node::Leaf(id) => Tree::Leaf(*id),
-        Node::Split(o, a, b) => Tree::Split(*o, Box::new(freeze(nodes, *a)), Box::new(freeze(nodes, *b))),
+        Node::Split(o, a, b) => {
+            Tree::Split(*o, Box::new(freeze(nodes, *a)), Box::new(freeze(nodes, *b)))
+        }
     }
 }
 
@@ -127,8 +161,11 @@ pub fn simulate_steered(n: usize, pointers: &[(f64, f64)], layout: Rect) -> Resu
     let mut leaf_node: Vec<usize> = vec![0]; // insertion index - 1 -> node index
     for k in 2..=n {
         let pointer = pointers[k - 2];
-        let mut ranked: Vec<(f64, usize)> =
-            leaf_node.iter().enumerate().map(|(i, &node)| (distance(pointer, boxes[&node]), i)).collect();
+        let mut ranked: Vec<(f64, usize)> = leaf_node
+            .iter()
+            .enumerate()
+            .map(|(i, &node)| (distance(pointer, boxes[&node]), i))
+            .collect();
         ranked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
         if ranked.len() > 1 && (ranked[1].0 - ranked[0].0).abs() < 1e-6 {
             return Err(format!(
@@ -179,12 +216,18 @@ pub fn layout_box(rects: &[Rect], gaps_out: f64) -> Rect {
 /// The order in which to insert `rects` (saved tiled windows of one workspace) so that
 /// dwindle regrows their tree with the pointer at `pointer`: indices into `rects`, first
 /// insertion first. `Err(reason)` when no such order exists.
-pub fn computed_order(rects: &[Rect], pointer: (f64, f64), gaps_out: f64, tol: f64) -> Result<Vec<usize>, String> {
+pub fn computed_order(
+    rects: &[Rect],
+    pointer: (f64, f64),
+    gaps_out: f64,
+    tol: f64,
+) -> Result<Vec<usize>, String> {
     if rects.len() < 2 {
         return Ok((0..rects.len()).collect());
     }
     let items: Vec<(usize, Rect)> = rects.iter().copied().enumerate().collect();
-    let saved = reconstruct(&items, tol).ok_or("the saved rectangles are not a dwindle partition")?;
+    let saved =
+        reconstruct(&items, tol).ok_or("the saved rectangles are not a dwindle partition")?;
     let sim = simulate(rects.len(), pointer, layout_box(rects, gaps_out))?;
     let mut mapping = HashMap::new();
     if !matches(&sim, &saved, &mut mapping) {
@@ -198,6 +241,13 @@ pub fn computed_order(rects: &[Rect], pointer: (f64, f64), gaps_out: f64, tol: f
     Ok(order)
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SteerSplit {
+    pub anchor: usize,
+    pub orient: Orient,
+    pub ratio: f64,
+}
+
 /// One insertion of a steered growth
 #[derive(Clone, Debug, PartialEq)]
 pub struct SteerStep {
@@ -206,6 +256,7 @@ pub struct SteerStep {
     /// Where the pointer must be when this window is inserted (`None` for the first window,
     /// which splits nothing)
     pub pointer: Option<(f64, f64)>,
+    pub split: Option<SteerSplit>,
 }
 
 /// The insertion order and per-insertion pointer positions that grow ANY dwindle tree.
@@ -219,19 +270,75 @@ pub fn steer_schedule(rects: &[Rect], gaps_out: f64, tol: f64) -> Result<Vec<Ste
         return Ok(vec![]);
     }
     let items: Vec<(usize, Rect)> = rects.iter().copied().enumerate().collect();
-    let tree = reconstruct(&items, tol).ok_or("the saved rectangles are not a dwindle partition")?;
-    fn occupant(t: &Tree) -> usize {
-        match t {
-            Tree::Leaf(i) => *i,
-            Tree::Split(_, a, _) => occupant(a),
-        }
+    let tree =
+        reconstruct(&items, tol).ok_or("the saved rectangles are not a dwindle partition")?;
+    struct Partition {
+        bounds: Rect,
+        anchor: usize,
+        children: Option<(Orient, usize, usize)>,
     }
-    let mut steps = vec![SteerStep { window: occupant(&tree), pointer: None }];
-    let mut queue = std::collections::VecDeque::from([(&tree, layout_box(rects, gaps_out))]);
-    while let Some((node, b)) = queue.pop_front() {
-        if let Tree::Split(_, a, c) = node {
-            let (_, first, second) = split_box(b);
-            steps.push(SteerStep { window: occupant(c), pointer: Some(((b.0 + b.2) / 2.0, (b.1 + b.3) / 2.0)) });
+    fn cache(tree: &Tree, rects: &[Rect], nodes: &mut Vec<Partition>) -> usize {
+        let node = match tree {
+            Tree::Leaf(i) => Partition {
+                bounds: rects[*i],
+                anchor: *i,
+                children: None,
+            },
+            Tree::Split(orient, first, second) => {
+                let a = cache(first, rects, nodes);
+                let c = cache(second, rects, nodes);
+                let (x, y) = (nodes[a].bounds, nodes[c].bounds);
+                Partition {
+                    bounds: (x.0.min(y.0), x.1.min(y.1), x.2.max(y.2), x.3.max(y.3)),
+                    anchor: nodes[a].anchor,
+                    children: Some((*orient, a, c)),
+                }
+            }
+        };
+        nodes.push(node);
+        nodes.len() - 1
+    }
+    let mut nodes = Vec::with_capacity(rects.len() * 2 - 1);
+    let root = cache(&tree, rects, &mut nodes);
+    let mut steps = vec![SteerStep {
+        window: nodes[root].anchor,
+        pointer: None,
+        split: None,
+    }];
+    let mut queue = std::collections::VecDeque::from([(root, layout_box(rects, gaps_out))]);
+    while let Some((index, b)) = queue.pop_front() {
+        if let Some((orient, a, c)) = nodes[index].children {
+            let (x, y) = (nodes[a].bounds, nodes[c].bounds);
+            let (ratio, first, second) = match orient {
+                Orient::V => {
+                    let cut = (x.2 + y.0) / 2.0;
+                    (
+                        2.0 * (cut - b.0) / (b.2 - b.0),
+                        (b.0, b.1, cut, b.3),
+                        (cut, b.1, b.2, b.3),
+                    )
+                }
+                Orient::H => {
+                    let cut = (x.3 + y.1) / 2.0;
+                    (
+                        2.0 * (cut - b.1) / (b.3 - b.1),
+                        (b.0, b.1, b.2, cut),
+                        (b.0, cut, b.2, b.3),
+                    )
+                }
+            };
+            if !(0.1..=1.9).contains(&ratio) {
+                return Err("saved divider is outside dwindle's split ratio range".into());
+            }
+            steps.push(SteerStep {
+                window: nodes[c].anchor,
+                pointer: Some(((b.0 + b.2) / 2.0, (b.1 + b.3) / 2.0)),
+                split: Some(SteerSplit {
+                    anchor: nodes[a].anchor,
+                    orient,
+                    ratio,
+                }),
+            });
             queue.push_back((a, first));
             queue.push_back((c, second));
         }
@@ -243,7 +350,12 @@ pub fn steer_schedule(rects: &[Rect], gaps_out: f64, tol: f64) -> Result<Vec<Ste
 pub fn reading_order(rects: &[Rect]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..rects.len()).collect();
     order.sort_by(|&a, &b| {
-        rects[a].0.partial_cmp(&rects[b].0).unwrap().then(rects[a].1.partial_cmp(&rects[b].1).unwrap()).then(a.cmp(&b))
+        rects[a]
+            .0
+            .partial_cmp(&rects[b].0)
+            .unwrap()
+            .then(rects[a].1.partial_cmp(&rects[b].1).unwrap())
+            .then(a.cmp(&b))
     });
     order
 }
@@ -274,7 +386,8 @@ mod tests {
         fn walk(t: &Tree, b: Rect, out: &mut HashMap<usize, Rect>) {
             match t {
                 Tree::Leaf(i) => {
-                    let inset = |edge: f64, at: f64| if (edge - at).abs() < 0.5 { 12.0 } else { 7.0 };
+                    let inset =
+                        |edge: f64, at: f64| if (edge - at).abs() < 0.5 { 12.0 } else { 7.0 };
                     out.insert(
                         *i,
                         (
@@ -308,7 +421,11 @@ mod tests {
         let tree = simulate(4, BL, BOX).unwrap();
         let expected = Tree::Split(
             Orient::V,
-            Box::new(Tree::Split(Orient::H, leaf(1), Box::new(Tree::Split(Orient::V, leaf(3), leaf(4))))),
+            Box::new(Tree::Split(
+                Orient::H,
+                leaf(1),
+                Box::new(Tree::Split(Orient::V, leaf(3), leaf(4))),
+            )),
             leaf(2),
         );
         assert_eq!(tree, expected);
@@ -320,7 +437,11 @@ mod tests {
         let tree = simulate(4, TL, BOX).unwrap();
         let expected = Tree::Split(
             Orient::V,
-            Box::new(Tree::Split(Orient::H, Box::new(Tree::Split(Orient::V, leaf(1), leaf(4))), leaf(3))),
+            Box::new(Tree::Split(
+                Orient::H,
+                Box::new(Tree::Split(Orient::V, leaf(1), leaf(4))),
+                leaf(3),
+            )),
             leaf(2),
         );
         assert_eq!(tree, expected);
@@ -332,7 +453,11 @@ mod tests {
         let tree = reconstruct(&items, CUT_TOLERANCE).unwrap();
         let expected = Tree::Split(
             Orient::V,
-            Box::new(Tree::Split(Orient::H, leaf(0), Box::new(Tree::Split(Orient::V, leaf(2), leaf(3))))),
+            Box::new(Tree::Split(
+                Orient::H,
+                leaf(0),
+                Box::new(Tree::Split(Orient::V, leaf(2), leaf(3))),
+            )),
             leaf(1),
         );
         assert_eq!(tree, expected);
@@ -340,14 +465,20 @@ mod tests {
 
     #[test]
     fn test_computed_order_of_the_fixture_is_its_build_order() {
-        assert_eq!(computed_order(&s4(), BL, 12.0, CUT_TOLERANCE), Ok(vec![0, 1, 2, 3]));
+        assert_eq!(
+            computed_order(&s4(), BL, 12.0, CUT_TOLERANCE),
+            Ok(vec![0, 1, 2, 3])
+        );
     }
 
     #[test]
     fn test_computed_order_ignores_the_order_the_rectangles_are_listed_in() {
         // the same four windows listed in reverse: the order names the same windows
         let reversed: Vec<Rect> = s4().into_iter().rev().collect();
-        assert_eq!(computed_order(&reversed, BL, 12.0, CUT_TOLERANCE), Ok(vec![3, 2, 1, 0]));
+        assert_eq!(
+            computed_order(&reversed, BL, 12.0, CUT_TOLERANCE),
+            Ok(vec![3, 2, 1, 0])
+        );
     }
 
     #[test]
@@ -359,7 +490,10 @@ mod tests {
             (967.0, 38.0, 1908.0, 1068.0),
             (12.0, 560.0, 953.0, 1068.0),
         ];
-        assert_eq!(computed_order(&shape, BL, 12.0, CUT_TOLERANCE), Ok(vec![0, 1, 2]));
+        assert_eq!(
+            computed_order(&shape, BL, 12.0, CUT_TOLERANCE),
+            Ok(vec![0, 1, 2])
+        );
         // ... a pointer on the right half splits the full-height window instead
         let err = computed_order(&shape, TR, 12.0, CUT_TOLERANCE).unwrap_err();
         assert!(err.contains("not one dwindle grows"), "{err}");
@@ -374,7 +508,10 @@ mod tests {
         ];
         assert!(computed_order(&shape, BL, 12.0, CUT_TOLERANCE).is_err());
         // a pointer on the right grows it: step 2 splits #1, step 3 splits #2
-        assert_eq!(computed_order(&shape, TR, 12.0, CUT_TOLERANCE), Ok(vec![0, 1, 2]));
+        assert_eq!(
+            computed_order(&shape, TR, 12.0, CUT_TOLERANCE),
+            Ok(vec![0, 1, 2])
+        );
     }
 
     #[test]
@@ -390,7 +527,11 @@ mod tests {
                 // listed back to front, the order names the windows back to front
                 let rev: Vec<Rect> = rects.iter().rev().copied().collect();
                 let expected: Vec<usize> = (0..n).rev().collect();
-                assert_eq!(computed_order(&rev, pointer, 12.0, CUT_TOLERANCE), Ok(expected), "reversed n={n}");
+                assert_eq!(
+                    computed_order(&rev, pointer, 12.0, CUT_TOLERANCE),
+                    Ok(expected),
+                    "reversed n={n}"
+                );
             }
         }
     }
@@ -420,22 +561,41 @@ mod tests {
     #[test]
     fn test_cut_tolerance_edges() {
         // two side-by-side windows with a gap just inside / outside the tolerance
-        let inside = vec![(12.0, 38.0, 940.0, 1068.0), (940.0 + 23.0, 38.0, 1908.0, 1068.0)];
-        assert!(reconstruct(&inside.iter().copied().enumerate().collect::<Vec<_>>(), CUT_TOLERANCE).is_some());
+        let inside = [
+            (12.0, 38.0, 940.0, 1068.0),
+            (940.0 + 23.0, 38.0, 1908.0, 1068.0),
+        ];
+        assert!(reconstruct(
+            &inside.iter().copied().enumerate().collect::<Vec<_>>(),
+            CUT_TOLERANCE
+        )
+        .is_some());
         // overlapping by more than the tolerance has no cut
-        let outside = vec![(12.0, 38.0, 960.0, 1068.0), (900.0, 38.0, 1908.0, 1068.0)];
-        assert!(reconstruct(&outside.iter().copied().enumerate().collect::<Vec<_>>(), CUT_TOLERANCE).is_none());
+        let outside = [(12.0, 38.0, 960.0, 1068.0), (900.0, 38.0, 1908.0, 1068.0)];
+        assert!(reconstruct(
+            &outside.iter().copied().enumerate().collect::<Vec<_>>(),
+            CUT_TOLERANCE
+        )
+        .is_none());
     }
 
     #[test]
     fn test_single_and_empty_sets() {
         assert_eq!(computed_order(&[], BL, 12.0, CUT_TOLERANCE), Ok(vec![]));
-        assert_eq!(computed_order(&[(12.0, 38.0, 1908.0, 1068.0)], BL, 12.0, CUT_TOLERANCE), Ok(vec![0]));
+        assert_eq!(
+            computed_order(&[(12.0, 38.0, 1908.0, 1068.0)], BL, 12.0, CUT_TOLERANCE),
+            Ok(vec![0])
+        );
     }
 
     #[test]
     fn test_reading_order_is_x_then_y_then_position() {
-        let rects = vec![(500.0, 0.0, 600.0, 10.0), (0.0, 500.0, 10.0, 600.0), (0.0, 0.0, 10.0, 10.0), (0.0, 0.0, 20.0, 20.0)];
+        let rects = vec![
+            (500.0, 0.0, 600.0, 10.0),
+            (0.0, 500.0, 10.0, 600.0),
+            (0.0, 0.0, 10.0, 10.0),
+            (0.0, 0.0, 20.0, 20.0),
+        ];
         assert_eq!(reading_order(&rects), vec![2, 3, 1, 0]);
     }
 
@@ -443,7 +603,9 @@ mod tests {
     fn relabel(t: &Tree, f: &dyn Fn(usize) -> usize) -> Tree {
         match t {
             Tree::Leaf(i) => Tree::Leaf(f(*i)),
-            Tree::Split(o, a, b) => Tree::Split(*o, Box::new(relabel(a, f)), Box::new(relabel(b, f))),
+            Tree::Split(o, a, b) => {
+                Tree::Split(*o, Box::new(relabel(a, f)), Box::new(relabel(b, f)))
+            }
         }
     }
 
@@ -456,13 +618,25 @@ mod tests {
         let grown = simulate_steered(rects.len(), &pointers, layout_box(rects, 12.0)).unwrap();
         // insertion index k (1-based) is the window steps[k - 1].window
         let by_insertion = relabel(&grown, &|k| steps[k - 1].window);
-        let saved = reconstruct(&rects.iter().copied().enumerate().collect::<Vec<_>>(), CUT_TOLERANCE).unwrap();
+        let saved = reconstruct(
+            &rects.iter().copied().enumerate().collect::<Vec<_>>(),
+            CUT_TOLERANCE,
+        )
+        .unwrap();
         by_insertion == saved
     }
 
     // The WS9 trees of playtest round 2: the same three windows in the two shapes the loader flipped between
-    const WS9_B: [Rect; 3] = [(12.0, 38.0, 953.0, 546.0), (12.0, 560.0, 953.0, 1068.0), (967.0, 38.0, 1908.0, 1068.0)];
-    const WS9_C: [Rect; 3] = [(12.0, 38.0, 953.0, 1068.0), (967.0, 38.0, 1908.0, 546.0), (967.0, 560.0, 1908.0, 1068.0)];
+    const WS9_B: [Rect; 3] = [
+        (12.0, 38.0, 953.0, 546.0),
+        (12.0, 560.0, 953.0, 1068.0),
+        (967.0, 38.0, 1908.0, 1068.0),
+    ];
+    const WS9_C: [Rect; 3] = [
+        (12.0, 38.0, 953.0, 1068.0),
+        (967.0, 38.0, 1908.0, 546.0),
+        (967.0, 560.0, 1908.0, 1068.0),
+    ];
 
     #[test]
     fn test_steering_reaches_trees_no_single_pointer_grows() {
@@ -471,22 +645,24 @@ mod tests {
         }
         // WS9_C (full-height left) is unreachable at a bottom-left pointer: the unsteered path refuses it
         assert!(computed_order(&WS9_C, BL, 12.0, CUT_TOLERANCE).is_err());
-        // the steered order is independent of the pointer: it has no pointer argument at all
-        assert_eq!(
-            steer_schedule(&WS9_C, 12.0, CUT_TOLERANCE).unwrap().iter().map(|s| s.window).collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
     }
 
     #[test]
     fn test_steering_regrows_every_shape_a_pointer_can_grow_and_resized_dividers() {
         for pointer in [TL, TR, BL, BR] {
             for n in 1..=7 {
-                assert!(steered_regrows(&grown(n, pointer)), "n={n} pointer={pointer:?}");
+                assert!(
+                    steered_regrows(&grown(n, pointer)),
+                    "n={n} pointer={pointer:?}"
+                );
             }
         }
         // a divider dragged off 50/50 still has the same topology
-        let skewed = [(12.0, 38.0, 600.0, 1068.0), (614.0, 38.0, 1908.0, 400.0), (614.0, 414.0, 1908.0, 1068.0)];
+        let skewed = [
+            (12.0, 38.0, 600.0, 1068.0),
+            (614.0, 38.0, 1908.0, 400.0),
+            (614.0, 414.0, 1908.0, 1068.0),
+        ];
         assert!(steered_regrows(&skewed));
     }
 
@@ -503,5 +679,66 @@ mod tests {
         let overlap = [(12.0, 38.0, 1000.0, 1068.0), (900.0, 38.0, 1908.0, 1068.0)];
         assert!(steer_schedule(&overlap, 12.0, CUT_TOLERANCE).is_err());
         assert_eq!(steer_schedule(&[], 12.0, CUT_TOLERANCE), Ok(vec![]));
+    }
+    #[test]
+    fn steered_dividers_restore_three_unequal_columns_before_descendants() {
+        let rects = [
+            (21.0, 55.0, 578.0, 1059.0),
+            (590.0, 55.0, 1141.0, 1059.0),
+            (1153.0, 55.0, 1899.0, 1059.0),
+        ];
+        let area = layout_box(&rects, 1.0);
+        let steps = steer_schedule(&rects, 1.0, CUT_TOLERANCE).unwrap();
+        let mut leaves = vec![(steps[0].window, area)];
+        for step in &steps[1..] {
+            let pointer = step.pointer.unwrap();
+            let index = (0..leaves.len())
+                .min_by(|&a, &b| {
+                    distance(pointer, leaves[a].1)
+                        .partial_cmp(&distance(pointer, leaves[b].1))
+                        .unwrap()
+                })
+                .unwrap();
+            let split = step.split.as_ref().unwrap();
+            assert_eq!(
+                leaves[index].0, split.anchor,
+                "pointer must select the unsplit parent"
+            );
+            let b = leaves[index].1;
+            let (first, second) = match split.orient {
+                Orient::V => {
+                    let cut = b.0 + (b.2 - b.0) * split.ratio / 2.0;
+                    ((b.0, b.1, cut, b.3), (cut, b.1, b.2, b.3))
+                }
+                Orient::H => {
+                    let cut = b.1 + (b.3 - b.1) * split.ratio / 2.0;
+                    ((b.0, b.1, b.2, cut), (b.0, cut, b.2, b.3))
+                }
+            };
+            leaves[index].1 = first;
+            leaves.push((step.window, second));
+        }
+        for (index, b) in leaves {
+            let inset = |edge: f64, outer: f64| {
+                if (edge - outer).abs() < 0.01 {
+                    1.0
+                } else {
+                    6.0
+                }
+            };
+            let actual = [
+                b.0 + inset(b.0, area.0),
+                b.1 + inset(b.1, area.1),
+                b.2 - inset(b.2, area.2),
+                b.3 - inset(b.3, area.3),
+            ];
+            let expected = rects[index];
+            for (actual, expected) in actual
+                .into_iter()
+                .zip([expected.0, expected.1, expected.2, expected.3])
+            {
+                assert!((actual - expected).abs() < 0.01, "{actual} != {expected}");
+            }
+        }
     }
 }

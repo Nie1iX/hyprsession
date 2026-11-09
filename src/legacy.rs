@@ -54,16 +54,18 @@ pub fn main() -> hyprland::Result<()> {
     let save_interval = args.save_interval;
     let default_path = env::var("HOME").unwrap() + "/.local/share/hyprsession";
     let session_path = args.session_path.unwrap_or(default_path);
-    let (dialect, source) = crate::dispatch::resolve_dialect(crate::dispatch::DialectChoice::Auto, args.simulate)
-        .unwrap_or_else(|e| {
-            eprintln!("Error: {e}");
-            exit(1);
-        });
+    let (dialect, source) =
+        crate::dispatch::resolve_dialect(crate::dispatch::DialectChoice::Auto, args.simulate)
+            .unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                exit(1);
+            });
     println!("Dispatch dialect: {dialect} ({source})");
 
     let sessions = LocalSession {
         base_path: session_path.clone(),
         adjust_clients_only: false,
+        merge: false,
         load_time: 30,
         simulate: args.simulate,
         save_duplicate_pids: args.save_duplicate_pids,
@@ -76,14 +78,15 @@ pub fn main() -> hyprland::Result<()> {
         exit(1);
     }
 
-    create_dir_all(&session_path).expect(&format!("Failed to create session dir: {session_path}"));
+    create_dir_all(&session_path)
+        .unwrap_or_else(|err| panic!("Failed to create session dir: {session_path}: {err:?}"));
 
     match mode {
         Mode::Default | Mode::LoadAndExit => sessions.load(""),
         Mode::SaveAndExit | Mode::SaveOnly => sessions.save(""),
     }?;
 
-    if mode == Mode::LoadAndExit  {
+    if mode == Mode::LoadAndExit {
         std::thread::sleep(time::Duration::from_secs(args.load_time + 5));
     }
 

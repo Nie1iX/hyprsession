@@ -24,7 +24,10 @@ pub fn should_detach() -> bool {
 /// Start `cmd` in its own session with SIGHUP ignored, stdin closed and stdout/stderr in `log`
 pub fn spawn_detached(mut cmd: Command, log: &Path) -> std::io::Result<Child> {
     let out = File::create(log)?;
-    cmd.env(DETACHED_ENV, "1").stdin(Stdio::null()).stdout(out.try_clone()?).stderr(out);
+    cmd.env(DETACHED_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(out.try_clone()?)
+        .stderr(out);
     // SAFETY: only async-signal-safe calls (setsid, signal) between fork and exec
     unsafe {
         cmd.pre_exec(|| {
@@ -73,7 +76,11 @@ mod tests {
 
     fn sid_of(pid: u32) -> String {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-        stat[stat.rfind(')').unwrap() + 1..].split_whitespace().nth(3).unwrap().to_string()
+        stat[stat.rfind(')').unwrap() + 1..]
+            .split_whitespace()
+            .nth(3)
+            .unwrap()
+            .to_string()
     }
 
     #[test]
@@ -91,7 +98,10 @@ mod tests {
         let code = follow(&mut child, &log, &mut shown);
         assert_eq!(code, 0);
         let text = String::from_utf8(shown).unwrap();
-        assert!(text.contains(&format!("sid {pid}")), "its own session leader: {text}");
+        assert!(
+            text.contains(&format!("sid {pid}")),
+            "its own session leader: {text}"
+        );
         assert_ne!(sid_of(std::process::id()), pid.to_string());
         let ignored = text.lines().find(|l| l.starts_with("SigIgn")).unwrap();
         let mask = u64::from_str_radix(ignored.split_whitespace().nth(1).unwrap(), 16).unwrap();
@@ -123,7 +133,8 @@ mod tests {
     #[test]
     fn test_detach_can_be_switched_off_and_does_not_recurse() {
         // pure environment logic; the two variables are only read here and in main
-        let detached = std::env::var_os(DETACHED_ENV).is_some() || std::env::var_os(NO_DETACH_ENV).is_some();
+        let detached =
+            std::env::var_os(DETACHED_ENV).is_some() || std::env::var_os(NO_DETACH_ENV).is_some();
         assert_eq!(should_detach(), !detached);
     }
 }

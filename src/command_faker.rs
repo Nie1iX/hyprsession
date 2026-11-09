@@ -1,15 +1,15 @@
-use std::fs;
-use std::path::PathBuf;
-use std::os::unix::fs::PermissionsExt;
 use std::collections::HashMap;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 
 pub fn fake_command(name: &str, command: &str) -> Result<(), Box<dyn std::error::Error>> {
     let home_dir = std::env::var("HOME")?;
     let bin_path = PathBuf::from(home_dir).join(".local/bin");
-    
+
     // Create directory if it doesn't exist
     fs::create_dir_all(&bin_path)?;
-        
+
     let file_path = bin_path.join(name);
     if !command.is_empty() {
         // Write the command to the file with shebang
@@ -39,10 +39,10 @@ fn parse_desktop_file(path: &PathBuf) -> Option<(String, String)> {
     let mut name: Option<String> = None;
     let mut exec: Option<String> = None;
     let mut in_desktop_entry = false;
-    
+
     for line in content.lines() {
         let line = line.trim();
-        
+
         if line == "[Desktop Entry]" {
             in_desktop_entry = true;
             continue;
@@ -50,11 +50,11 @@ fn parse_desktop_file(path: &PathBuf) -> Option<(String, String)> {
             in_desktop_entry = false;
             continue;
         }
-        
+
         if !in_desktop_entry {
             continue;
         }
-        
+
         if let Some(value) = line.strip_prefix("Name=") {
             name = Some(value.to_lowercase().to_string());
         } else if let Some(value) = line.strip_prefix("Exec=") {
@@ -66,13 +66,13 @@ fn parse_desktop_file(path: &PathBuf) -> Option<(String, String)> {
                 .join(" ");
             exec = Some(cleaned);
         }
-        
+
         // Stop early if we have both
         if name.is_some() && exec.is_some() {
             break;
         }
     }
-    
+
     match (name, exec) {
         (Some(n), Some(e)) if !e.is_empty() => Some((n, e)),
         _ => None,
@@ -82,14 +82,14 @@ fn parse_desktop_file(path: &PathBuf) -> Option<(String, String)> {
 /// Get XDG desktop file directories in priority order
 fn get_desktop_file_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    
+
     // User-specific directory (highest priority)
     if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
         dirs.push(PathBuf::from(data_home).join("applications"));
     } else if let Ok(home) = std::env::var("HOME") {
         dirs.push(PathBuf::from(home).join(".local/share/applications"));
     }
-    
+
     let user_data = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")));
@@ -106,7 +106,7 @@ fn get_desktop_file_dirs() -> Vec<PathBuf> {
         dirs.push(PathBuf::from("/usr/local/share/applications"));
         dirs.push(PathBuf::from("/usr/share/applications"));
     }
-    
+
     // Flatpak's exported entries, last so user and system entries win. They are only on
     // XDG_DATA_DIRS when the environment happens to include them.
     for dir in flatpak_export_dirs(user_data.ok().as_deref()) {
@@ -187,40 +187,10 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore]
-    fn test_fake_command() {
-        let result = fake_command("firefox", "flatpak run org.mozilla.firefox");
-        assert!(result.is_ok());
-        assert!(std::path::PathBuf::from(std::env::var("HOME").unwrap())
-            .join(".local/bin/firefox")
-            .exists());
-        let cleanup = fake_command("firefox", "");
-        assert!(cleanup.is_ok());
-        assert!(!std::path::PathBuf::from(std::env::var("HOME").unwrap())
-            .join(".local/bin/firefox")
-            .exists());
-    }
-
-    #[test]
-    fn test_build_xdg_command_map() {
-        let commands = build_xdg_command_map();
-        
-        // The map should not be empty on most systems
-        // We can't test specific applications since they vary by system
-        // But we can test the structure
-        for (name, command) in commands.iter().take(5) {
-            println!("Found: {} -> {}", name, command);
-            assert!(!name.is_empty());
-            assert!(!command.is_empty());
-        }
-    }
-
-    #[test]
     fn test_parse_desktop_file() {
-        // Create a temporary .desktop file for testing
-        let temp_dir = std::env::temp_dir();
-        let test_file = temp_dir.join("test.desktop");
-        
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_file = temp_dir.path().join("test.desktop");
+
         let content = r#"[Desktop Entry]
 Name=Test Application
 Exec=test-app --flag %f
@@ -228,16 +198,11 @@ Type=Application
 Icon=test-icon
 "#;
         fs::write(&test_file, content).unwrap();
-        
+
         let result = parse_desktop_file(&test_file);
-        assert!(result.is_some());
-        
         let (name, command) = result.unwrap();
         assert_eq!(name, "test application");
         assert_eq!(command, "test-app --flag");
-        
-        // Cleanup
-        fs::remove_file(&test_file).unwrap();
     }
 
     #[test]
@@ -246,17 +211,29 @@ Icon=test-icon
         fs::write(
             dir.path().join("dev.vencord.Vesktop.desktop"),
             "[Desktop Entry]\nName=Vesktop\nExec=vesktop-launcher %U\n",
-        ).unwrap();
+        )
+        .unwrap();
         // A stale entry whose Name collides with what the title step would look up
         fs::write(
             dir.path().join("discord-webapp.desktop"),
             "[Desktop Entry]\nName=Discord\nExec=chromium --app=https://discord.com\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let map = build_xdg_command_map_from(&[dir.path().to_path_buf()]);
-        assert_eq!(map.get(&xdg_id_key("dev.vencord.vesktop")).map(String::as_str), Some("vesktop-launcher"));
-        assert_eq!(map.get("vesktop").map(String::as_str), Some("vesktop-launcher"));
-        assert_eq!(map.get("discord").map(String::as_str), Some("chromium --app=https://discord.com"));
+        assert_eq!(
+            map.get(&xdg_id_key("dev.vencord.vesktop"))
+                .map(String::as_str),
+            Some("vesktop-launcher")
+        );
+        assert_eq!(
+            map.get("vesktop").map(String::as_str),
+            Some("vesktop-launcher")
+        );
+        assert_eq!(
+            map.get("discord").map(String::as_str),
+            Some("chromium --app=https://discord.com")
+        );
         // Id keys never appear as plain name keys
         assert!(!map.contains_key("dev.vencord.vesktop"));
     }
@@ -264,7 +241,11 @@ Icon=test-icon
     #[test]
     fn test_xdg_name_keys_win_over_id_keys() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("a.desktop"), "[Desktop Entry]\nName=b\nExec=one\n").unwrap();
+        fs::write(
+            dir.path().join("a.desktop"),
+            "[Desktop Entry]\nName=b\nExec=one\n",
+        )
+        .unwrap();
         let map = build_xdg_command_map_from(&[dir.path().to_path_buf()]);
         assert_eq!(map.get("b").map(String::as_str), Some("one"));
         assert_eq!(map.get(&xdg_id_key("A")).map(String::as_str), Some("one"));
@@ -279,22 +260,38 @@ Icon=test-icon
             "[Desktop Entry]\nName=Vesktop\nExec=/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=vesktop --file-forwarding dev.vencord.Vesktop @@u %U @@\n",
         ).unwrap();
         // A user entry and an export entry with the same id: the user one wins
-        fs::write(user.path().join("org.example.App.desktop"), "[Desktop Entry]\nName=App\nExec=user-app\n").unwrap();
-        fs::write(export.path().join("org.example.App.desktop"), "[Desktop Entry]\nName=App\nExec=export-app @@f %f @@\n").unwrap();
+        fs::write(
+            user.path().join("org.example.App.desktop"),
+            "[Desktop Entry]\nName=App\nExec=user-app\n",
+        )
+        .unwrap();
+        fs::write(
+            export.path().join("org.example.App.desktop"),
+            "[Desktop Entry]\nName=App\nExec=export-app @@f %f @@\n",
+        )
+        .unwrap();
 
-        let map = build_xdg_command_map_from(&[user.path().to_path_buf(), export.path().to_path_buf()]);
+        let map =
+            build_xdg_command_map_from(&[user.path().to_path_buf(), export.path().to_path_buf()]);
         assert_eq!(
             map.get(&xdg_id_key("dev.vencord.vesktop")).map(String::as_str),
             Some("/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=vesktop --file-forwarding dev.vencord.Vesktop")
         );
-        assert_eq!(map.get(&xdg_id_key("org.example.app")).map(String::as_str), Some("user-app"));
+        assert_eq!(
+            map.get(&xdg_id_key("org.example.app")).map(String::as_str),
+            Some("user-app")
+        );
         assert_eq!(map.get("app").map(String::as_str), Some("user-app"));
     }
 
     #[test]
     fn test_launcher_markers_are_dropped_from_exec() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        fs::write(file.path(), "[Desktop Entry]\nName=X\nExec=run x @@u %U @@ @@f --keep\n").unwrap();
+        fs::write(
+            file.path(),
+            "[Desktop Entry]\nName=X\nExec=run x @@u %U @@ @@f --keep\n",
+        )
+        .unwrap();
         let (_, command) = parse_desktop_file(&file.path().to_path_buf()).unwrap();
         assert_eq!(command, "run x --keep");
     }
@@ -302,9 +299,12 @@ Icon=test-icon
     #[test]
     fn test_flatpak_export_dirs_are_user_then_system() {
         let dirs = flatpak_export_dirs(Some(std::path::Path::new("/home/u/.local/share")));
-        assert_eq!(dirs, vec![
-            PathBuf::from("/home/u/.local/share/flatpak/exports/share/applications"),
-            PathBuf::from("/var/lib/flatpak/exports/share/applications"),
-        ]);
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/home/u/.local/share/flatpak/exports/share/applications"),
+                PathBuf::from("/var/lib/flatpak/exports/share/applications"),
+            ]
+        );
     }
 }

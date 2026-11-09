@@ -1,11 +1,14 @@
-pub mod session;
 pub mod command_detection;
 pub mod command_faker;
 pub mod detach;
 pub mod dispatch;
 pub mod dwindle;
-pub mod load;
-pub mod queue;
+pub mod ipc;
 pub mod legacy;
+pub mod lifecycle;
+pub mod load;
 pub mod procfs;
+pub mod queue;
 pub mod resume;
+pub mod session;
+pub(crate) mod tray;

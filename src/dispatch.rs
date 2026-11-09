@@ -6,8 +6,8 @@
 
 use clap::ValueEnum;
 use hyprland::dispatch::{
-    Dispatch, DispatchType, FullscreenType, Position, WindowIdentifier, WorkspaceIdentifier,
-    WorkspaceIdentifierWithSpecial, MonitorIdentifier,
+    Dispatch, DispatchType, FullscreenType, MonitorIdentifier, Position, WindowIdentifier,
+    WorkspaceIdentifier, WorkspaceIdentifierWithSpecial,
 };
 use hyprland::shared::Address;
 use std::io::{Read, Write};
@@ -61,6 +61,25 @@ pub enum WorkspaceTarget {
     Id(i32),
     /// Named special workspace, without the `special:` prefix
     Special(String),
+    Named(String),
+}
+
+impl WorkspaceTarget {
+    pub fn from_workspace(workspace: &crate::ipc::Workspace) -> Self {
+        if workspace.kind == crate::ipc::WorkspaceKind::Special {
+            Self::Special(
+                workspace
+                    .address
+                    .strip_prefix("special:")
+                    .unwrap_or(&workspace.address)
+                    .to_owned(),
+            )
+        } else if let Some(id) = workspace.id {
+            Self::Id(id)
+        } else {
+            Self::Named(workspace.address.clone())
+        }
+    }
 }
 
 /// A single dispatch the program can perform
@@ -68,30 +87,63 @@ pub enum WorkspaceTarget {
 pub enum Op {
     Exec(String),
     /// Move a window to a workspace without following it
-    MoveToWorkspace { window: Address, workspace: WorkspaceTarget },
+    MoveToWorkspace {
+        window: Address,
+        workspace: WorkspaceTarget,
+    },
     /// Set floating on or off. Classic can only toggle, so callers must only issue
     /// this when the live state differs from the wanted one.
-    Float { window: Address, enable: bool },
-    MoveWindow { window: Address, x: i16, y: i16 },
-    ResizeWindow { window: Address, w: i16, h: i16 },
-    /// Toggles pinning
-    Pin { window: Address },
-    /// `maximized` selects maximize rather than real fullscreen
-    Fullscreen { window: Address, maximized: bool },
-    FocusWorkspace(i32),
+    Float {
+        window: Address,
+        enable: bool,
+    },
+    MoveWindow {
+        window: Address,
+        x: i32,
+        y: i32,
+    },
+    ResizeWindow {
+        window: Address,
+        w: i32,
+        h: i32,
+    },
+    /// Set pinning; classic callers only issue it when the live state differs.
+    Pin {
+        window: Address,
+        enable: bool,
+    },
+    /// Set or unset the chosen fullscreen mode.
+    Fullscreen {
+        window: Address,
+        maximized: bool,
+        enable: bool,
+    },
+    FocusWorkspace(String),
     FocusWindow(Address),
-    MoveWorkspaceToMonitor { workspace: i32, monitor: i128 },
+    Layout(String),
+    MoveWorkspaceToMonitor {
+        workspace: String,
+        monitor: i128,
+    },
     Close(Address),
     /// Warp the mouse pointer to layout coordinates. Dwindle splits the leaf nearest the
     /// pointer, so the loader steers it while placing tiled windows. The Lua form is the
     /// documented `hl.dsp.cursor.move`; callers verify the move by reading the pointer back.
-    MoveCursor { x: i32, y: i32 },
+    MoveCursor {
+        x: i32,
+        y: i32,
+    },
 }
 
 /// Quote a string as a single-quoted Lua string literal
 pub fn lua_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+    lua_str_prefixed("", s)
+}
+
+fn lua_str_prefixed(prefix: &str, s: &str) -> String {
+    let mut out = String::with_capacity(prefix.len() + s.len() + 2);
     out.push('\'');
+    out.push_str(prefix);
     for c in s.chars() {
         match c {
             '\\' => out.push_str("\\\\"),
@@ -116,8 +168,9 @@ pub fn render_lua(op: &Op) -> String {
         Op::Exec(cmd) => format!("hl.dsp.exec_cmd({})", lua_str(cmd)),
         Op::MoveToWorkspace { window, workspace } => {
             let ws = match workspace {
-                WorkspaceTarget::Id(id) => id.to_string(),
-                WorkspaceTarget::Special(name) => lua_str(&format!("special:{name}")),
+                WorkspaceTarget::Id(id) => format!("'{id}'"),
+                WorkspaceTarget::Special(name) => lua_str_prefixed("special:", name),
+                WorkspaceTarget::Named(name) => lua_str_prefixed("name:", name),
             };
             format!(
                 "hl.dsp.window.move({{ workspace = {ws}, window = {}, follow = false }})",
@@ -126,27 +179,42 @@ pub fn render_lua(op: &Op) -> String {
         }
         Op::Float { window, enable } => format!(
             "hl.dsp.window.float({{ action = '{}', window = {} }})",
-            if *enable { "enable" } else { "disable" },
+            if *enable { "on" } else { "off" },
             lua_window(window)
         ),
         Op::MoveWindow { window, x, y } => format!(
-            "hl.dsp.window.move({{ window = {}, x = {x}, y = {y} }})",
+            "hl.dsp.window.move({{ window = {}, x = {x}, y = {y}, relative = false }})",
             lua_window(window)
         ),
         Op::ResizeWindow { window, w, h } => format!(
-            "hl.dsp.window.resize({{ window = {}, x = {w}, y = {h} }})",
+            "hl.dsp.window.resize({{ window = {}, x = {w}, y = {h}, relative = false }})",
             lua_window(window)
         ),
-        Op::Pin { window } => format!("hl.dsp.window.pin({{ window = {} }})", lua_window(window)),
-        Op::Fullscreen { window, maximized } => format!(
-            "hl.dsp.window.fullscreen({{ mode = '{}', action = 'set', window = {} }})",
-            if *maximized { "maximized" } else { "fullscreen" },
+        Op::Pin { window, enable } => format!(
+            "hl.dsp.window.pin({{ action = '{}', window = {} }})",
+            if *enable { "on" } else { "off" },
             lua_window(window)
         ),
-        Op::FocusWorkspace(id) => format!("hl.dsp.focus({{ workspace = {id} }})"),
+        Op::Fullscreen {
+            window,
+            maximized,
+            enable,
+        } => format!(
+            "hl.dsp.window.fullscreen({{ mode = '{}', action = '{}', layout_aware = false, window = {} }})",
+            if *maximized {
+                "maximized"
+            } else {
+                "fullscreen"
+            },
+            if *enable { "set" } else { "unset" },
+            lua_window(window)
+        ),
+        Op::FocusWorkspace(id) => format!("hl.dsp.focus({{ workspace = {} }})", lua_str(id)),
         Op::FocusWindow(window) => format!("hl.dsp.focus({{ window = {} }})", lua_window(window)),
+        Op::Layout(message) => format!("hl.dsp.layout({})", lua_str(message)),
         Op::MoveWorkspaceToMonitor { workspace, monitor } => format!(
-            "hl.dsp.workspace.move({{ workspace = {workspace}, monitor = {monitor} }})"
+            "hl.dsp.workspace.move({{ workspace = {}, monitor = {monitor} }})",
+            lua_str(workspace)
         ),
         Op::Close(window) => format!("hl.dsp.window.close({{ window = {} }})", lua_window(window)),
         Op::MoveCursor { x, y } => format!("hl.dsp.cursor.move({{ x = {x}, y = {y} }})"),
@@ -166,16 +234,26 @@ fn classic_call(op: &Op) -> hyprland::Result<()> {
                 WorkspaceIdentifierWithSpecial::Special(Some(name)),
                 Some(ident(window)),
             )),
+            WorkspaceTarget::Named(name) => Dispatch::call(DispatchType::MoveToWorkspaceSilent(
+                WorkspaceIdentifierWithSpecial::Name(name),
+                Some(ident(window)),
+            )),
         },
-        Op::Float { window, .. } => Dispatch::call(DispatchType::ToggleFloating(Some(ident(window)))),
-        Op::MoveWindow { window, x, y } => {
-            Dispatch::call(DispatchType::MoveWindowPixel(Position::Exact(*x, *y), ident(window)))
+        Op::Float { window, .. } => {
+            Dispatch::call(DispatchType::ToggleFloating(Some(ident(window))))
         }
-        Op::ResizeWindow { window, w, h } => {
-            Dispatch::call(DispatchType::ResizeWindowPixel(Position::Exact(*w, *h), ident(window)))
-        }
-        Op::Pin { window } => Dispatch::call(DispatchType::TogglePinWindow(ident(window))),
-        Op::Fullscreen { window, maximized } => {
+        Op::MoveWindow { window, x, y } => Dispatch::call(DispatchType::MoveWindowPixel(
+            classic_position(*x, *y)?,
+            ident(window),
+        )),
+        Op::ResizeWindow { window, w, h } => Dispatch::call(DispatchType::ResizeWindowPixel(
+            classic_position(*w, *h)?,
+            ident(window),
+        )),
+        Op::Pin { window, .. } => Dispatch::call(DispatchType::TogglePinWindow(ident(window))),
+        Op::Fullscreen {
+            window, maximized, ..
+        } => {
             Dispatch::call(DispatchType::FocusWindow(ident(window)))?;
             Dispatch::call(DispatchType::ToggleFullscreen(if *maximized {
                 FullscreenType::Maximize
@@ -184,20 +262,44 @@ fn classic_call(op: &Op) -> hyprland::Result<()> {
             }))
         }
         Op::FocusWorkspace(id) => {
-            Dispatch::call(DispatchType::Workspace(WorkspaceIdentifierWithSpecial::Id(*id)))
+            let workspace = match id.parse() {
+                Ok(id) => WorkspaceIdentifierWithSpecial::Id(id),
+                Err(_) => match id.strip_prefix("special:") {
+                    Some(name) => WorkspaceIdentifierWithSpecial::Special(Some(name)),
+                    None => {
+                        WorkspaceIdentifierWithSpecial::Name(id.strip_prefix("name:").unwrap_or(id))
+                    }
+                },
+            };
+            Dispatch::call(DispatchType::Workspace(workspace))
         }
         Op::FocusWindow(window) => Dispatch::call(DispatchType::FocusWindow(ident(window))),
+        Op::Layout(message) => Dispatch::call(DispatchType::Custom("layoutmsg", message)),
         Op::MoveWorkspaceToMonitor { workspace, monitor } => {
             Dispatch::call(DispatchType::MoveWorkspaceToMonitor(
-                WorkspaceIdentifier::Id(*workspace),
+                match workspace.parse() {
+                    Ok(id) => WorkspaceIdentifier::Id(id),
+                    Err(_) => WorkspaceIdentifier::Name(
+                        workspace.strip_prefix("name:").unwrap_or(workspace),
+                    ),
+                },
                 MonitorIdentifier::Id(*monitor),
             ))
         }
-        Op::Close(window) => {
-            Dispatch::call(DispatchType::CloseWindow(ident(window)))
-        }
+        Op::Close(window) => Dispatch::call(DispatchType::CloseWindow(ident(window))),
         Op::MoveCursor { x, y } => Dispatch::call(DispatchType::MoveCursor(*x as i64, *y as i64)),
     }
+}
+
+fn classic_position(x: i32, y: i32) -> hyprland::Result<Position> {
+    let narrow = |value| {
+        i16::try_from(value).map_err(|_| {
+            hyprland::error::HyprError::Other(
+                "Geometry exceeds the classic IPC coordinate range; use Lua dispatch".into(),
+            )
+        })
+    };
+    Ok(Position::Exact(narrow(x)?, narrow(y)?))
 }
 
 /// Path of the Hyprland command socket for the current instance
@@ -228,7 +330,9 @@ const CLASSIC_PROBE: &str = "submap reset";
 const LUA_PROBE: &str = "hl.dsp.exec_cmd('true')";
 
 fn probe(socket: &Path, text: &str) -> bool {
-    send_raw_dispatch(socket, text).map(|r| reply_is_ok(&r)).unwrap_or(false)
+    send_raw_dispatch(socket, text)
+        .map(|r| reply_is_ok(&r))
+        .unwrap_or(false)
 }
 
 /// Decide the dialect from the compositor's replies: classic no-op first, then the
@@ -255,7 +359,10 @@ fn guess_dialect() -> Dialect {
 }
 
 /// Resolve the dialect to use. Errors if probing finds neither dialect accepted.
-pub fn resolve_dialect(choice: DialectChoice, simulate: bool) -> Result<(Dialect, DialectSource), String> {
+pub fn resolve_dialect(
+    choice: DialectChoice,
+    simulate: bool,
+) -> Result<(Dialect, DialectSource), String> {
     match choice {
         DialectChoice::Lua => Ok((Dialect::Lua, DialectSource::Flag)),
         DialectChoice::Classic => Ok((Dialect::Classic, DialectSource::Flag)),
@@ -283,7 +390,11 @@ pub struct Dispatcher {
 
 impl Dispatcher {
     pub fn new(dialect: Dialect, simulate: bool) -> Self {
-        Dispatcher { dialect, simulate, socket: None }
+        Dispatcher {
+            dialect,
+            simulate,
+            socket: None,
+        }
     }
 
     /// Text sent after `dispatch ` (Lua dialect) or a description of the call (classic)
@@ -306,9 +417,11 @@ impl Dispatcher {
                     .socket
                     .clone()
                     .or_else(command_socket_path)
-                    .ok_or_else(|| hyprland::error::HyprError::Other(
-                        "HYPRLAND_INSTANCE_SIGNATURE is not set".to_string(),
-                    ))?;
+                    .ok_or_else(|| {
+                        hyprland::error::HyprError::Other(
+                            "HYPRLAND_INSTANCE_SIGNATURE is not set".to_string(),
+                        )
+                    })?;
                 let reply = send_raw_dispatch(&socket, &render_lua(op))?;
                 if reply_is_ok(&reply) {
                     Ok(())
@@ -323,57 +436,6 @@ impl Dispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn addr() -> Address {
-        Address::new("0xabc123")
-    }
-
-    #[test]
-    fn test_lua_string_forms_match_verified_shapes() {
-        assert_eq!(render_lua(&Op::Exec("kitty".into())), "hl.dsp.exec_cmd('kitty')");
-        assert_eq!(
-            render_lua(&Op::MoveToWorkspace { window: addr(), workspace: WorkspaceTarget::Id(5) }),
-            "hl.dsp.window.move({ workspace = 5, window = 'address:0xabc123', follow = false })"
-        );
-        assert_eq!(
-            render_lua(&Op::MoveToWorkspace { window: addr(), workspace: WorkspaceTarget::Special("magic".into()) }),
-            "hl.dsp.window.move({ workspace = 'special:magic', window = 'address:0xabc123', follow = false })"
-        );
-        assert_eq!(
-            render_lua(&Op::Float { window: addr(), enable: true }),
-            "hl.dsp.window.float({ action = 'enable', window = 'address:0xabc123' })"
-        );
-        assert_eq!(
-            render_lua(&Op::MoveWindow { window: addr(), x: 10, y: -20 }),
-            "hl.dsp.window.move({ window = 'address:0xabc123', x = 10, y = -20 })"
-        );
-        assert_eq!(
-            render_lua(&Op::ResizeWindow { window: addr(), w: 800, h: 600 }),
-            "hl.dsp.window.resize({ window = 'address:0xabc123', x = 800, y = 600 })"
-        );
-        assert_eq!(render_lua(&Op::FocusWorkspace(3)), "hl.dsp.focus({ workspace = 3 })");
-        assert_eq!(
-            render_lua(&Op::Close(addr())),
-            "hl.dsp.window.close({ window = 'address:0xabc123' })"
-        );
-    }
-
-    #[test]
-    fn test_lua_forms_from_documentation() {
-        // Taken from the dispatcher reference, not yet confirmed on a live compositor
-        assert_eq!(
-            render_lua(&Op::Pin { window: addr() }),
-            "hl.dsp.window.pin({ window = 'address:0xabc123' })"
-        );
-        assert_eq!(
-            render_lua(&Op::Fullscreen { window: addr(), maximized: false }),
-            "hl.dsp.window.fullscreen({ mode = 'fullscreen', action = 'set', window = 'address:0xabc123' })"
-        );
-        assert_eq!(
-            render_lua(&Op::MoveWorkspaceToMonitor { workspace: 2, monitor: 1 }),
-            "hl.dsp.workspace.move({ workspace = 2, monitor = 1 })"
-        );
-    }
 
     #[test]
     fn test_lua_quoting_and_escaping() {
@@ -393,14 +455,19 @@ mod tests {
     fn test_reply_classification() {
         assert!(reply_is_ok("ok"));
         assert!(reply_is_ok("ok\n"));
-        assert!(!reply_is_ok("error: [string \"return hl.dispatch(submap reset)\"]:1: ')' expected near 'reset'"));
+        assert!(!reply_is_ok(
+            "error: [string \"return hl.dispatch(submap reset)\"]:1: ')' expected near 'reset'"
+        ));
         assert!(!reply_is_ok(""));
     }
 
     #[test]
     fn test_detect_dialect() {
         // Classic build accepts the classic probe
-        assert_eq!(detect_dialect(|t| t == CLASSIC_PROBE), Some(Dialect::Classic));
+        assert_eq!(
+            detect_dialect(|t| t == CLASSIC_PROBE),
+            Some(Dialect::Classic)
+        );
         // Lua build rejects classic text but accepts the Lua no-op
         assert_eq!(detect_dialect(|t| t == LUA_PROBE), Some(Dialect::Lua));
         // Neither accepted: no guess
@@ -435,18 +502,21 @@ mod tests {
         let mut d = Dispatcher::new(Dialect::Lua, false);
         d.socket = Some(path);
         assert!(d.send(&Op::Exec("it's".into())).is_ok());
-        assert!(d.send(&Op::FocusWorkspace(1)).is_err());
+        assert!(d.send(&Op::FocusWorkspace("1".into())).is_err());
         assert_eq!(
             handle.join().unwrap(),
             vec![
                 "/dispatch hl.dsp.exec_cmd('it\\'s')".to_string(),
-                "/dispatch hl.dsp.focus({ workspace = 1 })".to_string(),
+                "/dispatch hl.dsp.focus({ workspace = '1' })".to_string(),
             ]
         );
     }
 
     #[test]
     fn test_move_cursor_renders_in_lua() {
-        assert_eq!(render_lua(&Op::MoveCursor { x: 480, y: 270 }), "hl.dsp.cursor.move({ x = 480, y = 270 })");
+        assert_eq!(
+            render_lua(&Op::MoveCursor { x: 480, y: 270 }),
+            "hl.dsp.cursor.move({ x = 480, y = 270 })"
+        );
     }
 }

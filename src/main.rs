@@ -1,26 +1,13 @@
-use std::fs::create_dir_all;
-use std::io::Write;
-use std::process::exit;
-use std::{env, thread, time};
-//use serde::Deserialize;
 use clap::{Parser, ValueEnum};
+use std::env;
+use std::path::Path;
+use std::process::exit;
 
-pub mod command_detection;
-pub mod command_faker;
-pub mod detach;
-pub mod dispatch;
-pub mod dwindle;
-pub mod queue;
-pub mod load;
-pub mod procfs;
-pub mod resume;
-pub mod legacy;
-pub mod session;
-
-use crate::session::*;
-use crate::command_faker::fake_command;
-use crate::command_detection::command_exists_in_path;
-use crate::dispatch::{resolve_dialect, Dialect, DialectChoice};
+use hyprsession::command_detection::command_exists_in_path;
+use hyprsession::command_faker::fake_command;
+use hyprsession::dispatch::{resolve_dialect, Dialect, DialectChoice};
+use hyprsession::lifecycle::Lifecycle;
+use hyprsession::session::*;
 
 #[derive(Copy, Clone, PartialEq, ValueEnum)]
 enum Mode {
@@ -29,6 +16,12 @@ enum Mode {
 
     /// Save the session
     Save,
+
+    /// Save periodically without restoring
+    Daemon,
+
+    /// Save and freeze the snapshot, then exit Hyprland
+    Logout,
 
     /// List available sessions
     List,
@@ -81,175 +74,88 @@ struct Args {
     #[arg(long, default_value_t = false)]
     adjust_clients_only: bool,
 
+    /// Restore alongside existing windows (load mode only)
+    #[arg(long, conflicts_with = "adjust_clients_only")]
+    merge: bool,
+
     /// Only load this workspace of the session, leaving the others untouched (load mode only)
     #[arg(long)]
-    workspace: Option<i32>,
-}
-
-fn migration_check(session_path: &str) {
-    let old_session = std::path::Path::new(session_path).join("exec.conf");
-    let new_session = std::path::Path::new(session_path).join("default");
-    if old_session.exists() {
-        if std::path::Path::new(session_path).join("exec.conf").exists() && !new_session.join("exec.conf").exists() {
-            println!("Migrating session data from {} to {}", old_session.display(), new_session.display());
-            std::fs::create_dir_all(&new_session).unwrap();
-            std::fs::rename(old_session, new_session.join("exec.conf")).unwrap();
-            std::fs::write(new_session.join("clients.json"), "[]").unwrap();
-        }
-    }
+    workspace: Option<String>,
 }
 
 fn main() -> hyprland::Result<()> {
-    if std::env::args().any(|arg| arg == "--mode") {
-        eprintln!("Warning: '--mode' argument is deprecated. Please consult documentation for updated usage.");
-        crate::legacy::main()?;
-        exit(0);
+    // Snapshot argv, cwd and foreground commands are private session data.
+    unsafe {
+        libc::umask(0o077);
     }
-
     let args = Args::parse();
-    let session_path = if env::var("HYPRSESSION_PATH").is_ok() {
-        env::var("HYPRSESSION_PATH").unwrap()
-    } else {
-        env::var("HOME").unwrap() + "/.local/share/hyprsession"
-    };
-
-    create_dir_all(&session_path).expect(&format!("Failed to create session dir: {session_path}"));
-
-    // A load closes the terminal it was typed in: run it in its own session, writing to a log,
-    // and only follow that log from here
-    if args.mode == Mode::Load && !args.simulate && detach::should_detach() {
-        let log = std::path::Path::new(&session_path).join("load.log");
-        match env::current_exe().map(|exe| {
-            let mut cmd = std::process::Command::new(exe);
-            cmd.args(env::args().skip(1));
-            cmd
-        }) {
-            Ok(cmd) => match detach::spawn_detached(cmd, &log) {
-                Ok(mut child) => {
-                    let _ = writeln!(std::io::stdout(), "Load running detached (pid {}); log: {}", child.id(), log.display());
-                    exit(detach::follow(&mut child, &log, &mut std::io::stdout()));
-                }
-                Err(e) => eprintln!("Warning: could not detach the load ({e}); running it in this terminal"),
-            },
-            Err(e) => eprintln!("Warning: could not detach the load ({e}); running it in this terminal"),
-        }
-    }
-
-    println!("Using session path: {}", session_path);
-    migration_check(&session_path);
-
     if args.save_interval == 0 {
         eprintln!("Save interval needs to be greater than 0");
         exit(1);
     }
-
-    // Loading and clearing dispatch to Hyprland, so only they need a resolved dialect
-    let dialect = if matches!(args.mode, Mode::Default | Mode::Load | Mode::Clear) {
-        let (dialect, source) = resolve_dialect(args.dialect, args.simulate).unwrap_or_else(|e| {
-            eprintln!("Error: {e}");
-            exit(1);
-        });
-        println!("Dispatch dialect: {dialect} ({source})");
-        dialect
-    } else {
-        Dialect::Classic
-    };
-
-    if let Some(workspace) = args.workspace {
-        if args.mode != Mode::Load {
-            eprintln!("Error: --workspace can only be used with the load mode");
-            exit(1);
-        }
-        if workspace < 1 {
-            eprintln!("Error: --workspace needs a workspace number of 1 or more");
-            exit(1);
-        }
+    if args.name.is_empty() || args.name == "." || args.name == ".." || args.name.contains('/') {
+        eprintln!("Session name must be a single directory name");
+        exit(1);
     }
-
-    let session = LocalSession {
-        base_path: session_path.clone(),
+    if args.workspace.is_some() && args.mode != Mode::Load {
+        eprintln!("--workspace can only be used with load");
+        exit(1);
+    }
+    if args.merge && args.mode != Mode::Load {
+        eprintln!("--merge can only be used with load");
+        exit(1);
+    }
+    let root = env::var("HYPRSESSION_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/.local/share/hyprsession",
+            env::var("HOME").unwrap_or_default()
+        )
+    });
+    let lifecycle = Lifecycle::new(Path::new(&root))?;
+    let mut session = LocalSession {
+        base_path: root,
         load_time: args.load_time,
         adjust_clients_only: args.adjust_clients_only,
+        merge: args.merge,
         simulate: args.simulate,
         save_duplicate_pids: false,
-        dialect,
+        dialect: Dialect::Classic,
         workspace: args.workspace,
     };
-
     match args.mode {
-        Mode::Clear => {
-            session.clear()?;
+        Mode::Default | Mode::Daemon => lifecycle.daemon(
+            &mut session,
+            &args.name,
+            args.dialect,
+            args.save_interval,
+            args.mode == Mode::Default,
+        )?,
+        Mode::Save => {
+            lifecycle.save(&session, &args.name)?;
         }
-        Mode::Default | Mode::Load => {
-            session.load(&args.name)?;
+        Mode::Logout => lifecycle.logout(&session, &args.name, args.dialect)?,
+        Mode::Load => lifecycle.restore(&mut session, &args.name, args.dialect, false)?,
+        Mode::Clear => {
+            session.dialect = resolve_dialect(args.dialect, args.simulate)
+                .map_err(hyprland::error::HyprError::Other)?
+                .0;
+            session.clear()?;
         }
         Mode::List => {
             println!("Available sessions:");
-            let mut has_sessions = false;
-            for session_name in session.list() {
-                println!(" - {}", session_name);
-                has_sessions = true;
-            }
-            if !has_sessions {
-                println!("(No sessions found)");
+            for name in session.list() {
+                println!(" - {name}");
             }
         }
-        Mode::Delete => {
-            session.delete(&args.name);
-        }
-        Mode::Save => {
-            session.save(&args.name)?;
-        }
+        Mode::Delete => session.delete(&args.name),
         Mode::Command => {
-            let command_name = args.name.clone();
-            if command_name.is_empty() {
-                eprintln!("Error: Command name cannot be empty");
+            if command_exists_in_path(&args.name) {
+                eprintln!("Command already exists in PATH: {}", args.name);
                 exit(1);
             }
-
-            if command_exists_in_path(&command_name) {
-                eprintln!("Command '{}' already exists in PATH.", command_name);
-                exit(1);
-            }
-
-            match fake_command(&command_name, &args.command.clone()) {
-                Ok(_) => {
-                    println!("Fake command '{}' created successfully.", command_name);
-                }
-                Err(e) => {
-                    eprintln!("Failed to create command '{}': {}", command_name, e);
-                    exit(1);
-                }
-            }
+            fake_command(&args.name, &args.command)
+                .map_err(|e| hyprland::error::HyprError::Other(e.to_string()))?;
         }
     }
-
-    if args.mode != Mode::Default {
-        exit(0);
-    }
-
-    loop {
-        thread::sleep(time::Duration::from_secs(args.save_interval));
-        session.save(&args.name)?;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_migration_check() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let session_path = temp_dir.path().to_str().unwrap();
-
-        // Create the old session file
-        std::fs::write(temp_dir.path().join("exec.conf"), "test").unwrap();
-
-        migration_check(session_path);
-
-        // Check that the old session file was moved
-        assert!(!temp_dir.path().join("exec.conf").exists());
-        assert!(temp_dir.path().join("default").join("exec.conf").exists());
-    }
+    Ok(())
 }

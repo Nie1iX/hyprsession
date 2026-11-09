@@ -4,14 +4,17 @@
 //! All interaction with the compositor goes through `Host`, so the sequencing can be
 //! tested against a fake one.
 
+use crate::command_detection::{resolve_desktop_command, shell_join, shell_quote};
 use crate::dispatch::{Dispatcher, Op};
 use crate::dwindle;
+use crate::ipc::{self, Client, Workspace};
 use crate::queue::{ws_key, Held, PlacementQueue, WsKey};
-use crate::command_detection::{resolve_desktop_command, shell_join, shell_quote};
-use crate::resume::{program_identity, terminal_style, wrap_terminal_command, Relaunch, ResumeConfig};
+use crate::resume::{
+    program_identity, strip_wrapper, terminal_style, wrap_terminal_command, Relaunch, ResumeConfig,
+};
 use crate::session::{plan_adjustment, SavedClient};
-use hyprland::data::{Client, Clients, FullscreenMode, Workspace};
-use hyprland::shared::{Address, HyprData, HyprDataActive};
+use hyprland::data::FullscreenMode;
+use hyprland::shared::{Address, HyprData};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -27,6 +30,7 @@ pub enum RuleWorkspace {
     Id(i32),
     /// Special workspace; `None` is the anonymous one
     Special(Option<String>),
+    Named(String),
 }
 
 /// The placement rules written in front of a launch line in exec.conf
@@ -35,8 +39,8 @@ pub struct ExecRules {
     pub monitor: Option<i128>,
     pub workspace: Option<RuleWorkspace>,
     pub float: bool,
-    pub at: Option<(i16, i16)>,
-    pub size: Option<(i16, i16)>,
+    pub at: Option<(i32, i32)>,
+    pub size: Option<(i32, i32)>,
     pub pin: bool,
     pub fullscreen: Option<i32>,
     /// Rule words that were not recognised (ignored)
@@ -61,11 +65,13 @@ pub struct GroupInfo {
     pub saved: Vec<usize>,
 }
 
-fn two_numbers(rule: &str, rest: &[&str]) -> Result<(i16, i16), String> {
+fn two_numbers(rule: &str, rest: &[&str]) -> Result<(i32, i32), String> {
     match rest {
         [a, b] => Ok((
-            a.parse().map_err(|_| format!("bad number in rule '{rule}'"))?,
-            b.parse().map_err(|_| format!("bad number in rule '{rule}'"))?,
+            a.parse()
+                .map_err(|_| format!("bad number in rule '{rule}'"))?,
+            b.parse()
+                .map_err(|_| format!("bad number in rule '{rule}'"))?,
         )),
         _ => Err(format!("rule '{rule}' needs two numbers")),
     }
@@ -85,14 +91,18 @@ fn parse_rules(text: &str) -> Result<ExecRules, String> {
                 )
             }
             "workspace" => {
-                let target = rest.first().ok_or_else(|| format!("rule '{rule}' needs a workspace"))?;
+                let target = rest
+                    .first()
+                    .ok_or_else(|| format!("rule '{rule}' needs a workspace"))?;
                 rules.workspace = Some(if *target == "special" {
                     RuleWorkspace::Special(None)
                 } else if let Some(name) = target.strip_prefix("special:") {
                     RuleWorkspace::Special(Some(name.to_string()))
                 } else {
                     RuleWorkspace::Id(
-                        target.parse().map_err(|_| format!("bad workspace in rule '{rule}'"))?,
+                        target
+                            .parse()
+                            .map_err(|_| format!("bad workspace in rule '{rule}'"))?,
                     )
                 });
             }
@@ -125,11 +135,19 @@ pub fn parse_exec_line(line: &str) -> Result<ExecEntry, String> {
         if command.is_empty() {
             return Err(format!("no command in line: {line}"));
         }
-        Ok(ExecEntry { rules: parse_rules(rules)?, command: command.to_string(), group: None })
+        Ok(ExecEntry {
+            rules: parse_rules(rules)?,
+            command: command.to_string(),
+            group: None,
+        })
     } else if line.is_empty() {
         Err("empty line".to_string())
     } else {
-        Ok(ExecEntry { rules: ExecRules::default(), command: line.to_string(), group: None })
+        Ok(ExecEntry {
+            rules: ExecRules::default(),
+            command: line.to_string(),
+            group: None,
+        })
     }
 }
 
@@ -144,10 +162,19 @@ pub fn parse_exec_conf(text: &str) -> Result<Vec<ExecEntry>, String> {
 
 /// Placement rules equivalent to a saved window's state
 fn rules_from_client(client: &Client) -> ExecRules {
-    let workspace = match client.workspace.name.strip_prefix("special:") {
-        Some(name) => RuleWorkspace::Special(Some(name.to_string())),
-        None if client.workspace.id == -99 => RuleWorkspace::Special(None),
-        None => RuleWorkspace::Id(client.workspace.id),
+    let workspace = if client.workspace.kind == crate::ipc::WorkspaceKind::Special {
+        RuleWorkspace::Special(Some(
+            client
+                .workspace
+                .address
+                .strip_prefix("special:")
+                .unwrap_or(&client.workspace.address)
+                .to_owned(),
+        ))
+    } else if let Some(id) = client.workspace.id {
+        RuleWorkspace::Id(id)
+    } else {
+        RuleWorkspace::Named(client.workspace.address.clone())
     };
     ExecRules {
         monitor: client.monitor,
@@ -182,7 +209,7 @@ fn command_from_saved_argv(argv: &[String]) -> Option<String> {
 fn is_sandbox_internal(argv: &[String]) -> bool {
     argv.first()
         .and_then(|first| first.split_whitespace().next())
-        .map_or(false, |program| program.starts_with("/app/"))
+        .is_some_and(|program| program.starts_with("/app/"))
 }
 
 /// Launch entries for a new-format snapshot, built from the recorded argv. Windows are
@@ -192,13 +219,26 @@ fn is_sandbox_internal(argv: &[String]) -> bool {
 /// sandbox-internal launches through its desktop entry instead. Windows without argv
 /// cannot be launched and are skipped (they are still placed if their app brings them
 /// up).
-pub fn launch_entries_from_saved(saved: &[SavedClient], xdg_map: &HashMap<String, String>) -> Vec<ExecEntry> {
-    launch_entries_with(saved, xdg_map, &|dir| dir.is_dir(), &ResumeConfig::default())
+pub fn launch_entries_from_saved(
+    saved: &[SavedClient],
+    xdg_map: &HashMap<String, String>,
+) -> Vec<ExecEntry> {
+    launch_entries_with(
+        saved,
+        xdg_map,
+        &|dir| dir.is_dir(),
+        &ResumeConfig::default(),
+    )
 }
 
 /// Prefix a launch with `cd <cwd> &&` so it runs from its recorded directory. A
 /// directory that no longer exists leaves the launch unwrapped, with a warning.
-pub fn wrap_cwd(command: String, cwd: Option<&str>, window: &Client, dir_exists: &dyn Fn(&Path) -> bool) -> String {
+pub fn wrap_cwd(
+    command: String,
+    cwd: Option<&str>,
+    window: &Client,
+    dir_exists: &dyn Fn(&Path) -> bool,
+) -> String {
     let Some(dir) = cwd else { return command };
     if dir_exists(Path::new(dir)) {
         format!("cd {} && {}", shell_quote(dir), command)
@@ -221,7 +261,9 @@ fn terminal_launch(
     resume: &ResumeConfig,
     dir_exists: &dyn Fn(&Path) -> bool,
 ) -> String {
-    let Some(foreground) = window.foreground.as_ref() else { return command };
+    let Some(foreground) = window.foreground.as_ref() else {
+        return command;
+    };
     let title = &window.client.title;
     let (kind, program) = match resume.decide(foreground) {
         Relaunch::Linked => {
@@ -235,7 +277,11 @@ fn terminal_launch(
         Relaunch::Table(program) => ("resume command", program),
         Relaunch::Replay(program) => ("recorded command", program),
     };
-    let terminal = window.argv.as_deref().and_then(program_identity).unwrap_or_default();
+    let terminal = window
+        .argv
+        .as_deref()
+        .and_then(program_identity)
+        .unwrap_or_default();
     let Some(style) = terminal_style(&terminal) else {
         println!(
             "Warning: no verified way to run a command in '{terminal}'; terminal '{title}' restores at a clean prompt"
@@ -265,18 +311,53 @@ pub fn launch_entries_with(
     let mut group_rules: HashMap<String, ExecRules> = HashMap::new();
     let mut launched: HashMap<(String, i32), usize> = HashMap::new();
     for (index, window) in saved.iter().enumerate() {
-        let Some(argv) = window.argv.as_deref() else { continue };
-        let Some(mut command) = command_from_saved_argv(argv) else { continue };
-        let sandboxed = is_sandbox_internal(argv);
-        if sandboxed {
-            match resolve_desktop_command(&window.client, xdg_map) {
-                Some(entry_command) => command = entry_command,
-                None => println!(
-                    "Warning: '{}' ({}) runs inside a sandbox and has no desktop entry; launching its recorded command",
-                    window.client.title, window.client.class
-                ),
+        let argv = window.argv.as_deref().map(|argv| {
+            if let Some(style) = program_identity(argv).and_then(|program| terminal_style(&program))
+            {
+                std::borrow::Cow::Owned(strip_wrapper(argv, Some(style)))
+            } else {
+                std::borrow::Cow::Borrowed(argv)
             }
-        }
+        });
+        let sandboxed = argv.as_deref().is_some_and(is_sandbox_internal);
+        let unavailable = argv.as_deref().is_some_and(|args| {
+            let Some(program) = args.first() else {
+                return false;
+            };
+            let executable = if args.len() == 1
+                && program.contains(char::is_whitespace)
+                && !Path::new(program).exists()
+            {
+                program.split_whitespace().next().unwrap_or(program)
+            } else {
+                program
+            };
+            let path = Path::new(executable);
+            path.is_absolute() && !path.exists()
+        });
+        let command = if window
+            .client
+            .class
+            .eq_ignore_ascii_case("dev.noctalia.Noctalia")
+            && window.client.title == "Noctalia Settings"
+        {
+            // Its process argv starts the shell, not the settings window.
+            Some("noctalia msg settings-open".to_owned())
+        } else {
+            let command = argv.as_deref().and_then(command_from_saved_argv);
+            if command.is_none() || sandboxed || unavailable {
+                resolve_desktop_command(&window.client, xdg_map).or(command)
+            } else {
+                command
+            }
+        };
+        let Some(command) = command else {
+            println!(
+                "Warning: no launch command or desktop entry for '{}' ({})",
+                window.client.title, window.client.class
+            );
+            continue;
+        };
         let rules = group_rules
             .entry(command.clone())
             .or_insert_with(|| rules_from_client(&window.client))
@@ -300,7 +381,10 @@ pub fn launch_entries_with(
                 entries.push(ExecEntry {
                     rules,
                     command: launch,
-                    group: Some(GroupInfo { label, saved: vec![index] }),
+                    group: Some(GroupInfo {
+                        label,
+                        saved: vec![index],
+                    }),
                 });
             }
         }
@@ -315,6 +399,7 @@ pub fn launch_order(mut entries: Vec<ExecEntry>) -> Vec<ExecEntry> {
         let workspace = match &e.rules.workspace {
             Some(RuleWorkspace::Id(id)) => *id as i64,
             Some(RuleWorkspace::Special(_)) => i64::MAX,
+            Some(RuleWorkspace::Named(_)) => i64::MAX - 1,
             None => 0,
         };
         let (x, y) = e.rules.at.unwrap_or((0, 0));
@@ -327,17 +412,11 @@ pub fn launch_order(mut entries: Vec<ExecEntry>) -> Vec<ExecEntry> {
 pub fn desired_from_rules(live: &Client, rules: &ExecRules) -> Client {
     let mut wanted = live.clone();
     match &rules.workspace {
-        Some(RuleWorkspace::Id(id)) => {
-            wanted.workspace.id = *id;
-            wanted.workspace.name = id.to_string();
-        }
-        Some(RuleWorkspace::Special(None)) => {
-            wanted.workspace.id = -99;
-            wanted.workspace.name = "special".to_string();
-        }
-        Some(RuleWorkspace::Special(Some(name))) => {
-            wanted.workspace.id = -98;
-            wanted.workspace.name = format!("special:{name}");
+        Some(RuleWorkspace::Id(id)) => wanted.workspace = Workspace::numbered(*id),
+        Some(RuleWorkspace::Named(name)) => wanted.workspace = Workspace::from_selector(name),
+        Some(RuleWorkspace::Special(name)) => {
+            wanted.workspace =
+                Workspace::from_selector(&format!("special:{}", name.as_deref().unwrap_or("")))
         }
         None => {}
     }
@@ -367,7 +446,7 @@ pub fn placeholder_client() -> Client {
         "address": "0x<address>",
         "at": [0, 0],
         "size": [0, 0],
-        "workspace": { "id": 0, "name": "0" },
+        "workspace": { "address": "0", "id": 0, "type": "normal", "name": "0" },
         "floating": false,
         "fullscreen": 0,
         "fullscreenClient": 0,
@@ -400,7 +479,15 @@ pub struct Placer {
 
 impl Placer {
     pub fn new(saved: Vec<Client>) -> Self {
-        Placer { targets: saved.into_iter().map(|saved| Target { saved, matched: None }).collect() }
+        Placer {
+            targets: saved
+                .into_iter()
+                .map(|saved| Target {
+                    saved,
+                    matched: None,
+                })
+                .collect(),
+        }
     }
 
     pub fn is_complete(&self) -> bool {
@@ -409,11 +496,18 @@ impl Placer {
 
     /// Addresses of the live windows that have claimed a saved client
     pub fn claimed_addresses(&self) -> HashSet<Address> {
-        self.targets.iter().filter_map(|t| t.matched.clone()).collect()
+        self.targets
+            .iter()
+            .filter_map(|t| t.matched.clone())
+            .collect()
     }
 
     pub fn unmatched(&self) -> Vec<&Client> {
-        self.targets.iter().filter(|t| t.matched.is_none()).map(|t| &t.saved).collect()
+        self.targets
+            .iter()
+            .filter(|t| t.matched.is_none())
+            .map(|t| &t.saved)
+            .collect()
     }
 
     /// Claim a saved client for a live window; `None` when the window was already
@@ -438,7 +532,11 @@ impl Placer {
         own: &[usize],
         reserved: &HashSet<usize>,
     ) -> Option<(usize, Client)> {
-        if self.targets.iter().any(|t| t.matched.as_ref() == Some(&live.address)) {
+        if self
+            .targets
+            .iter()
+            .any(|t| t.matched.as_ref() == Some(&live.address))
+        {
             return None;
         }
         let same_class = |t: &Target| {
@@ -451,11 +549,35 @@ impl Placer {
                 .iter()
                 .enumerate()
                 .position(|(i, t)| fits(i, t) && t.saved.title == live.title)
-                .or_else(|| self.targets.iter().enumerate().position(|(i, t)| fits(i, t)))
+                .or_else(|| {
+                    self.targets
+                        .iter()
+                        .enumerate()
+                        .position(|(i, t)| fits(i, t))
+                })
         };
         let index = pick(&|i| own.contains(&i))
             .or_else(|| pick(&|i| !reserved.contains(&i)))
             .or_else(|| pick(&|_| true))?;
+        self.targets[index].matched = Some(live.address.clone());
+        Some((index, self.targets[index].saved.clone()))
+    }
+
+    fn assign_proven(&mut self, live: &Client, own: &[usize]) -> Option<(usize, Client)> {
+        if self
+            .targets
+            .iter()
+            .any(|t| t.matched.as_ref() == Some(&live.address))
+        {
+            return None;
+        }
+        let available = |i: &&usize| self.targets.get(**i).is_some_and(|t| t.matched.is_none());
+        let index = own
+            .iter()
+            .filter(available)
+            .find(|&&i| self.targets[i].saved.title == live.title)
+            .or_else(|| own.iter().find(available))
+            .copied()?;
         self.targets[index].matched = Some(live.address.clone());
         Some((index, self.targets[index].saved.clone()))
     }
@@ -478,9 +600,9 @@ pub struct LoadPlan {
     /// Polls to keep placing after the last launch
     pub tail_ticks: u64,
     /// Only this workspace's slice is being loaded
-    pub scope: Option<i32>,
+    pub scope: Option<String>,
     /// Workspace to focus once finished
-    pub restore_workspace: Option<i32>,
+    pub restore_workspace: Option<String>,
 }
 
 impl LoadPlan {
@@ -499,14 +621,15 @@ pub struct LoadReport {
     pub shortfalls: Vec<GroupShortfall>,
     /// One entry per workspace whose tiled windows were placed together
     pub flushes: Vec<FlushReport>,
-    /// Per workspace, read once after every placement is done: tiled windows at their saved geometry
+    /// Per workspace, after startup-state finalization: windows at their saved state and geometry.
     pub verification: Vec<WorkspaceCheck>,
+    pub incomplete: bool,
 }
 
-/// Final-state geometry check of one workspace's tiled windows
+/// Final-state verification of one workspace's restored windows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceCheck {
-    pub workspace: i32,
+    pub workspace: String,
     pub at_saved: usize,
     pub checked: usize,
     /// Titles of the windows that are not at their saved geometry
@@ -516,7 +639,7 @@ pub struct WorkspaceCheck {
 /// How one workspace's queued tiled windows were ordered
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlushReport {
-    pub workspace: i32,
+    pub workspace: String,
     pub windows: usize,
     /// `None`: placed in a computed dwindle insertion order (steered, or for the pointer as
     /// found); `Some(reason)`: saved reading order
@@ -546,7 +669,13 @@ pub struct ProcessInfo {
 pub trait Host {
     fn clients(&self) -> hyprland::Result<Vec<Client>>;
     fn send(&self, op: &Op) -> hyprland::Result<()>;
-    fn active_workspace(&self) -> Option<i32>;
+    fn active_workspace(&self) -> Option<String>;
+    fn failed(&self) -> bool {
+        false
+    }
+    fn merge_existing(&self) -> bool {
+        false
+    }
     /// Signal a process
     fn signal(&self, pid: i32, signal: Signal);
     /// Wait one poll interval
@@ -559,6 +688,10 @@ pub trait Host {
     /// What a window's process is running (argv, working directory): launch provenance
     fn process(&self, _pid: i32) -> Option<ProcessInfo> {
         None
+    }
+    /// Reveal a saved GUI from its verified tray process, without relaunching it.
+    fn reveal_tray_window(&self, _entry: &ExecEntry) -> bool {
+        false
     }
     /// Where the pointer was before the load touched anything (defaults to where it is now)
     fn pointer_origin(&self) -> Option<(i32, i32)> {
@@ -580,26 +713,58 @@ pub struct RealHost {
     pub dispatcher: Dispatcher,
     /// The pointer when the host was created: capture it before a load clears anything
     origin: Option<(i32, i32)>,
+    failed: std::cell::Cell<bool>,
+    merge: bool,
 }
 
 impl RealHost {
     pub fn new(dispatcher: Dispatcher) -> Self {
-        let origin = hyprland::data::CursorPosition::get().ok().map(|c| (c.x as i32, c.y as i32));
-        RealHost { dispatcher, origin }
+        let origin = hyprland::data::CursorPosition::get()
+            .ok()
+            .map(|c| (c.x as i32, c.y as i32));
+        RealHost {
+            dispatcher,
+            origin,
+            failed: std::cell::Cell::new(false),
+            merge: false,
+        }
+    }
+
+    pub fn merged(dispatcher: Dispatcher) -> Self {
+        let mut host = Self::new(dispatcher);
+        host.merge = true;
+        host
     }
 }
 
 impl Host for RealHost {
+    fn merge_existing(&self) -> bool {
+        self.merge
+    }
     fn clients(&self) -> hyprland::Result<Vec<Client>> {
-        Ok(Clients::get()?.iter().cloned().collect())
+        let result = ipc::clients();
+        if result.is_err() {
+            self.failed.set(true);
+        }
+        result
     }
 
     fn send(&self, op: &Op) -> hyprland::Result<()> {
-        self.dispatcher.send(op)
+        let result = self.dispatcher.send(op);
+        if result.is_err() {
+            self.failed.set(true);
+        }
+        result
     }
 
-    fn active_workspace(&self) -> Option<i32> {
-        Workspace::get_active().ok().map(|w| w.id)
+    fn active_workspace(&self) -> Option<String> {
+        ipc::active_workspace()
+            .ok()
+            .map(|w| w.selector().to_owned())
+    }
+
+    fn failed(&self) -> bool {
+        self.failed.get()
     }
 
     fn signal(&self, pid: i32, signal: Signal) {
@@ -607,7 +772,10 @@ impl Host for RealHost {
             Signal::Term => "-TERM",
             Signal::Kill => "-KILL",
         };
-        let _ = std::process::Command::new("kill").arg(flag).arg(pid.to_string()).output();
+        let _ = std::process::Command::new("kill")
+            .arg(flag)
+            .arg(pid.to_string())
+            .output();
     }
 
     fn pause(&self) {
@@ -619,15 +787,57 @@ impl Host for RealHost {
     }
 
     fn process(&self, pid: i32) -> Option<ProcessInfo> {
-        Some(ProcessInfo { argv: crate::command_detection::read_argv(pid)?, cwd: crate::command_detection::read_cwd(pid) })
+        Some(ProcessInfo {
+            argv: crate::command_detection::read_argv(pid)?,
+            cwd: crate::command_detection::read_cwd(pid),
+        })
+    }
+
+    fn reveal_tray_window(&self, entry: &ExecEntry) -> bool {
+        let Some(signature) = entry_signature(entry) else {
+            return false;
+        };
+        let Some(executable) = executable_path(&signature.0[0], signature.1.as_deref()) else {
+            return false;
+        };
+        let Ok(live) = self.clients() else {
+            return false;
+        };
+        let mapped = live.iter().filter(|c| c.mapped).map(|c| c.pid).collect();
+        crate::tray::activate_owned_window(&mapped, |pid| {
+            if std::fs::canonicalize(format!("/proc/{pid}/exe"))
+                .ok()
+                .as_ref()
+                != Some(&executable)
+            {
+                return false;
+            }
+            let Some(info) = self.process(pid) else {
+                return false;
+            };
+            process_matches(&signature, &info.argv, info.cwd.as_deref())
+                || (signature.0.len() > 1
+                    && packed_process_argv(&info).is_some_and(|argv| {
+                        process_matches(&signature, &argv, info.cwd.as_deref())
+                    }))
+        })
     }
 
     fn cursor_pos(&self) -> Option<(i32, i32)> {
-        hyprland::data::CursorPosition::get().ok().map(|c| (c.x as i32, c.y as i32))
+        hyprland::data::CursorPosition::get()
+            .ok()
+            .map(|c| (c.x as i32, c.y as i32))
     }
 
     fn option(&self, key: &str) -> Option<String> {
-        hyprland::keyword::Keyword::get(key).ok().map(|k| k.value.to_string())
+        let value: serde_json::Value = crate::ipc::request(&format!("j/getoption {key}")).ok()?;
+        ["str", "css", "int", "float"].iter().find_map(|field| {
+            let value = value.get(field)?;
+            value
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| value.as_number().map(ToString::to_string))
+        })
     }
 }
 
@@ -660,10 +870,10 @@ pub struct ClearReport {
 }
 
 /// Which windows a clear is allowed to touch
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Scope {
     All,
-    Workspace(i32),
+    Workspace(String),
 }
 
 fn describe(clients: &[Client]) -> String {
@@ -711,7 +921,10 @@ fn signal_targets(clients: &[Client]) -> Vec<i32> {
 /// Pids that have a live window outside the cleared scope: signalling one would take
 /// down a window the scope has no business touching
 pub fn shared_pids(live: &[Client], in_scope: &HashSet<Address>) -> HashSet<i32> {
-    live.iter().filter(|c| !in_scope.contains(&c.address)).map(|c| c.pid).collect()
+    live.iter()
+        .filter(|c| !in_scope.contains(&c.address))
+        .map(|c| c.pid)
+        .collect()
 }
 
 /// Close every window, escalating only for what stays: graceful close, then SIGTERM,
@@ -724,15 +937,21 @@ pub fn clear_session(host: &dyn Host, config: &ClearConfig) -> Result<ClearRepor
 /// `clear_session` restricted to a scope. Signal stages only reach pids whose live
 /// windows are **all** in scope: a window sharing its pid with another workspace's window
 /// gets the graceful close only, and if it refuses it is reported, never killed.
-pub fn clear_windows(host: &dyn Host, config: &ClearConfig, scope: Scope) -> Result<ClearReport, String> {
+pub fn clear_windows(
+    host: &dyn Host,
+    config: &ClearConfig,
+    scope: Scope,
+) -> Result<ClearReport, String> {
     let mut report = ClearReport::default();
-    let all = host.clients().map_err(|e| format!("cannot read the client list: {e}"))?;
+    let all = host
+        .clients()
+        .map_err(|e| format!("cannot read the client list: {e}"))?;
     // Scope is fixed by address when the clear starts, so a window that moves mid-clear stays in or out
     let initial: Vec<Client> = all
         .iter()
-        .filter(|c| match scope {
+        .filter(|c| match &scope {
             Scope::All => true,
-            Scope::Workspace(id) => c.workspace.id == id,
+            Scope::Workspace(id) => c.workspace.matches_selector(id),
         })
         .cloned()
         .collect();
@@ -742,17 +961,26 @@ pub fn clear_windows(host: &dyn Host, config: &ClearConfig, scope: Scope) -> Res
     let in_scope: HashSet<Address> = initial.iter().map(|c| c.address.clone()).collect();
     // Windows still open that belong to the scope (everything, for Scope::All)
     let scoped = |live: &[Client]| -> Vec<Client> {
-        live.iter().filter(|c| scope == Scope::All || in_scope.contains(&c.address)).cloned().collect()
+        live.iter()
+            .filter(|c| scope == Scope::All || in_scope.contains(&c.address))
+            .cloned()
+            .collect()
     };
     // The part of that which may be signalled: not sharing a pid with an out-of-scope window
     let signalable = |live: &[Client]| -> Vec<Client> {
         let shared = shared_pids(live, &in_scope);
-        scoped(live).into_iter().filter(|c| !shared.contains(&c.pid)).collect()
+        scoped(live)
+            .into_iter()
+            .filter(|c| !shared.contains(&c.pid))
+            .collect()
     };
 
-    match scope {
+    match &scope {
         Scope::All => println!("Closing {} windows gracefully", initial.len()),
-        Scope::Workspace(id) => println!("Closing {} windows on workspace {id} gracefully", initial.len()),
+        Scope::Workspace(id) => println!(
+            "Closing {} windows on workspace {id} gracefully",
+            initial.len()
+        ),
     }
     for client in &initial {
         if host.send(&Op::Close(client.address.clone())).is_err() {
@@ -793,7 +1021,9 @@ pub fn clear_windows(host: &dyn Host, config: &ClearConfig, scope: Scope) -> Res
         ("graceful close", Signal::Term, config.term_ticks),
         ("SIGTERM", Signal::Kill, config.kill_ticks),
     ] {
-        let live = host.clients().map_err(|e| format!("cannot read the client list: {e}"))?;
+        let live = host
+            .clients()
+            .map_err(|e| format!("cannot read the client list: {e}"))?;
         let stuck = signalable(&live);
         if stuck.is_empty() {
             finish(&mut report, host);
@@ -801,7 +1031,14 @@ pub fn clear_windows(host: &dyn Host, config: &ClearConfig, scope: Scope) -> Res
         }
         let pids = signal_targets(&stuck);
         println!("Still open after {stage}: {}", describe(&stuck));
-        println!("Sending {} to pids {pids:?}", if signal == Signal::Term { "SIGTERM" } else { "SIGKILL" });
+        println!(
+            "Sending {} to pids {pids:?}",
+            if signal == Signal::Term {
+                "SIGTERM"
+            } else {
+                "SIGKILL"
+            }
+        );
         pids.iter().for_each(|&pid| host.signal(pid, signal));
         if signal == Signal::Term {
             report.termed = pids;
@@ -822,7 +1059,11 @@ pub fn clear_windows(host: &dyn Host, config: &ClearConfig, scope: Scope) -> Res
 }
 
 fn apply(host: &dyn Host, live: &Client, wanted: &Client) {
-    println!("found '{}' on workspace: {}", live.title, live.workspace.id);
+    println!(
+        "found '{}' on workspace: {}",
+        live.title,
+        live.workspace.selector()
+    );
     for op in plan_adjustment(live, wanted) {
         if host.send(&op).is_err() {
             println!("Warning: Failed to apply {:?}: {}", op, live.title);
@@ -837,19 +1078,19 @@ struct LoadState<'a> {
     queue: PlacementQueue,
     /// In a scoped load, every window outside the loaded workspace: never claimed, moved or reported
     protected: HashSet<Address>,
+    initial: HashMap<Address, usize>,
+    foreign: HashSet<Address>,
     /// Where the user's pointer was when the load began (restored at the end if the loader moved it)
     pointer_home: Option<(i32, i32)>,
     pointer_moved_by_us: bool,
     /// The workspace that was visible when the load began: windows are born on it
-    start_ws: Option<i32>,
+    start_ws: Option<String>,
     /// Launch entries started so far
     launched: usize,
     /// What each entry's process looks like (argv, working directory), for launch provenance
     signatures: Vec<Option<(Vec<String>, Option<String>)>>,
     /// The entry whose process owns a window, established from /proc, not from timing
     owners: HashMap<Address, usize>,
-    /// Every tiled claim that was placed: (live window, saved index), for the final geometry check
-    placed_tiled: Vec<(Address, usize)>,
     /// The compositor did not take a pointer warp: no more are attempted
     steering_refused: bool,
     /// Saved windows that a resume launch (a terminal under the hyprsession wrapper) will bring up
@@ -872,50 +1113,211 @@ const STAGE: &str = "hyprsession-stage";
 fn entry_signature(entry: &ExecEntry) -> Option<(Vec<String>, Option<String>)> {
     let words = crate::command_detection::shell_split(&entry.command);
     let (cwd, rest) = match words.as_slice() {
-        [cd, dir, and, rest @ ..] if cd == "cd" && and == "&&" => (Some(dir.clone()), rest.to_vec()),
+        [cd, dir, and, rest @ ..] if cd == "cd" && and == "&&" => {
+            (Some(dir.clone()), rest.to_vec())
+        }
         _ => (None, words),
     };
-    if rest.is_empty() { None } else { Some((rest, cwd)) }
+    if rest.is_empty() {
+        None
+    } else {
+        Some((rest, cwd))
+    }
 }
 
-fn process_matches(signature: &(Vec<String>, Option<String>), info: &ProcessInfo) -> bool {
+fn process_matches(
+    signature: &(Vec<String>, Option<String>),
+    actual: &[String],
+    actual_cwd: Option<&str>,
+) -> bool {
     let (argv, cwd) = signature;
-    let base = |s: &String| s.rsplit('/').next().unwrap_or(s).to_string();
-    info.argv.len() == argv.len()
-        && base(&info.argv[0]) == base(&argv[0])
-        && info.argv[1..] == argv[1..]
-        && cwd.as_ref().map_or(true, |dir| info.cwd.as_deref() == Some(dir.as_str()))
+    if argv.is_empty() || actual.len() != argv.len() || argv[0].is_empty() || actual[0].is_empty() {
+        return false;
+    }
+    let same_executable = if argv[0].contains('/') && actual[0].contains('/') {
+        argv[0] == actual[0]
+    } else {
+        argv[0].rsplit('/').next() == actual[0].rsplit('/').next()
+    };
+    same_executable
+        && actual[1..] == argv[1..]
+        && cwd
+            .as_ref()
+            .is_none_or(|dir| actual_cwd == Some(dir.as_str()))
+}
+
+fn executable_path(program: &str, cwd: Option<&str>) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let program = Path::new(program);
+    let path = if program.is_absolute() {
+        program.to_owned()
+    } else if program.components().count() > 1 {
+        cwd.map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())?
+            .join(program)
+    } else {
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|dir| dir.join(program))
+            .find(|path| {
+                path.metadata()
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })?
+    };
+    path.canonicalize().ok()
+}
+
+fn packed_process_argv(info: &ProcessInfo) -> Option<Vec<String>> {
+    let [line] = info.argv.as_slice() else {
+        return None;
+    };
+    if !line.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let path = Path::new(line);
+    let literal = if path.is_absolute() {
+        path.is_file()
+    } else {
+        info.cwd
+            .as_ref()
+            .is_some_and(|cwd| Path::new(cwd).join(path).is_file())
+    };
+    // Preserve real executable paths containing spaces instead of inventing arguments.
+    (!literal).then(|| crate::command_detection::shell_split(line))
+}
+
+fn merge_candidates(
+    host: &dyn Host,
+    plan: &LoadPlan,
+    live: &[Client],
+    protected: &HashSet<Address>,
+    signatures: &[Option<(Vec<String>, Option<String>)>],
+) -> HashMap<Address, usize> {
+    let mut candidates = Vec::new();
+    for window in live
+        .iter()
+        .filter(|c| c.mapped && !protected.contains(&c.address))
+    {
+        let info = host.process(window.pid);
+        let packed = info.as_ref().and_then(packed_process_argv);
+        let matching: Vec<_> = signatures
+            .iter()
+            .enumerate()
+            .filter(|(_, signature)| {
+                signature.as_ref().is_some_and(|signature| {
+                    info.as_ref().is_some_and(|info| {
+                        process_matches(signature, &info.argv, info.cwd.as_deref())
+                            || packed.as_ref().is_some_and(|argv| {
+                                process_matches(signature, argv, info.cwd.as_deref())
+                            })
+                    })
+                })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let proven = if matching.len() == 1 {
+            plan.entries[matching[0]]
+                .group
+                .as_ref()
+                .map(|g| g.saved.as_slice())
+                .unwrap_or_default()
+        } else {
+            &[]
+        };
+        let exact: Vec<_> = plan
+            .saved
+            .iter()
+            .enumerate()
+            .filter(|(_, saved)| {
+                saved.title == window.title
+                    && (saved.class == window.class || saved.initial_class == window.initial_class)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let titled: Vec<_> = proven
+            .iter()
+            .copied()
+            .filter(|&i| plan.saved.get(i).is_some_and(|s| s.title == window.title))
+            .collect();
+        let index = if titled.len() == 1 {
+            Some(titled[0])
+        } else if proven.len() == 1 {
+            Some(proven[0])
+        } else if exact.len() == 1
+            && ((matching.is_empty()
+                && plan
+                    .scope
+                    .as_ref()
+                    .is_none_or(|scope| window.workspace.matches_selector(scope)))
+                || matching.iter().any(|&i| {
+                    plan.entries[i]
+                        .group
+                        .as_ref()
+                        .is_some_and(|group| group.saved.contains(&exact[0]))
+                }))
+        {
+            Some(exact[0])
+        } else {
+            None
+        };
+        if let Some(index) = index {
+            candidates.push((window.address.clone(), index));
+        }
+    }
+    candidates
+        .iter()
+        .filter(|(_, index)| {
+            candidates
+                .iter()
+                .filter(|(_, other)| other == index)
+                .count()
+                == 1
+        })
+        .cloned()
+        .collect()
+}
+
+fn shared_workspace(live: &[Client], foreign: &HashSet<Address>, workspace: &str) -> bool {
+    live.iter().any(|c| {
+        c.mapped
+            && !c.floating
+            && foreign.contains(&c.address)
+            && c.workspace.selector() == workspace
+    })
 }
 
 /// A window belongs to the entry whose process it is; one that belongs to another entry does not
 /// count for, and is not bound to, the entry being waited for
 fn counts_for(st: &LoadState, address: &Address, entry: usize) -> bool {
-    st.owners.get(address).map_or(true, |&owner| owner == entry)
+    st.owners.get(address).is_none_or(|&owner| owner == entry)
 }
 
 /// Establish which launched entry owns each window not yet attributed. Only provable from /proc:
 /// a window whose process matches no launched entry stays unattributed (timing and class decide).
 fn attribute_owners(host: &dyn Host, st: &mut LoadState, live: &[Client]) {
-    for window in live.iter().filter(|c| c.mapped && !st.protected.contains(&c.address)) {
+    for window in live
+        .iter()
+        .filter(|c| c.mapped && !st.protected.contains(&c.address))
+    {
         if st.owners.contains_key(&window.address) {
             continue;
         }
-        let Some(info) = host.process(window.pid) else { continue };
-        let mut best: Option<(usize, bool)> = None;
-        for index in 0..st.launched.min(st.signatures.len()) {
-            let Some(signature) = &st.signatures[index] else { continue };
-            if !process_matches(signature, &info) {
-                continue;
+        let Some(info) = host.process(window.pid) else {
+            continue;
+        };
+        let packed = packed_process_argv(&info);
+        let mut matches = st.signatures.iter().enumerate().filter(|(_, signature)| {
+            signature.as_ref().is_some_and(|signature| {
+                process_matches(signature, &info.argv, info.cwd.as_deref())
+                    || (signature.0.len() > 1
+                        && packed.as_ref().is_some_and(|argv| {
+                            process_matches(signature, argv, info.cwd.as_deref())
+                        }))
+            })
+        });
+        if let Some((index, _)) = matches.next() {
+            if (host.merge_existing() || index < st.launched) && matches.next().is_none() {
+                st.owners.insert(window.address.clone(), index);
             }
-            let capacity = st.plan.entries[index].group.as_ref().map_or(0, |g| g.saved.len())
-                > st.owners.values().filter(|&&o| o == index).count();
-            // the earliest matching entry that can still take a window; else the earliest match
-            if best.map_or(true, |(_, had)| capacity && !had) {
-                best = Some((index, capacity));
-            }
-        }
-        if let Some((index, _)) = best {
-            st.owners.insert(window.address.clone(), index);
         }
     }
 }
@@ -937,7 +1339,11 @@ fn own_saves(entry: &ExecEntry) -> &[usize] {
 /// Read `key` as the first integer of its value ("12", "12,12,12,12" or "12 12 12 12")
 fn option_number(host: &dyn Host, key: &str, default: f64) -> f64 {
     host.option(key)
-        .and_then(|v| v.split(|c: char| !c.is_ascii_digit() && c != '.').find(|p| !p.is_empty()).map(str::to_string))
+        .and_then(|v| {
+            v.split(|c: char| !c.is_ascii_digit() && c != '.')
+                .find(|p| !p.is_empty())
+                .map(str::to_string)
+        })
         .and_then(|p| p.parse().ok())
         .unwrap_or(default)
 }
@@ -946,25 +1352,47 @@ fn option_number(host: &dyn Host, key: &str, default: f64) -> f64 {
 /// inserted: the computed dwindle insertion order when the compositor is in the configuration
 /// the model was measured in, saved reading order (with the reason) otherwise. Returns the
 /// pointer it computed for.
-fn insertion_order(host: &dyn Host, rects: &[dwindle::Rect]) -> (Vec<usize>, Option<String>, Option<(i32, i32)>) {
+fn insertion_order(
+    host: &dyn Host,
+    rects: &[dwindle::Rect],
+) -> (Vec<usize>, Option<String>, Option<(i32, i32)>) {
     let reading = || dwindle::reading_order(rects);
     let layout = host.option("general:layout");
     if layout.as_deref() != Some("dwindle") {
-        return (reading(), Some(format!("layout is {}, not dwindle", layout.as_deref().unwrap_or("unknown"))), None);
+        return (
+            reading(),
+            Some(format!(
+                "layout is {}, not dwindle",
+                layout.as_deref().unwrap_or("unknown")
+            )),
+            None,
+        );
     }
     let split = host.option("dwindle:force_split");
     if split.as_deref() != Some("2") {
         return (
             reading(),
-            Some(format!("dwindle:force_split is {}, not 2", split.as_deref().unwrap_or("unknown"))),
+            Some(format!(
+                "dwindle:force_split is {}, not 2",
+                split.as_deref().unwrap_or("unknown")
+            )),
             None,
         );
     }
     let Some(pointer) = host.cursor_pos() else {
-        return (reading(), Some("the pointer position is unknown".to_string()), None);
+        return (
+            reading(),
+            Some("the pointer position is unknown".to_string()),
+            None,
+        );
     };
     let gaps_out = option_number(host, "general:gaps_out", dwindle::DEFAULT_GAPS_OUT);
-    match dwindle::computed_order(rects, (pointer.0 as f64, pointer.1 as f64), gaps_out, dwindle::CUT_TOLERANCE) {
+    match dwindle::computed_order(
+        rects,
+        (pointer.0 as f64, pointer.1 as f64),
+        gaps_out,
+        dwindle::CUT_TOLERANCE,
+    ) {
         Ok(order) => (order, None, Some(pointer)),
         Err(reason) => (reading(), Some(reason), Some(pointer)),
     }
@@ -976,12 +1404,30 @@ const WARP_TOLERANCE: i32 = 3;
 /// rounding put saved and regrown rectangles a pixel or two apart
 const GEOMETRY_TOLERANCE: i32 = 6;
 
+fn window_at_saved_state(actual: &Client, saved: &Client, shared: bool) -> bool {
+    let near =
+        |a: i32, b: i32| (i64::from(a) - i64::from(b)).abs() <= i64::from(GEOMETRY_TOLERANCE);
+    actual.mapped
+        && (saved.pinned || actual.workspace.selector() == saved.workspace.selector())
+        && actual.floating == saved.floating
+        && actual.pinned == saved.pinned
+        && actual.fullscreen == saved.fullscreen
+        && (shared && !saved.floating
+            || saved.fullscreen != FullscreenMode::None
+            || (near(actual.at.0, saved.at.0)
+                && near(actual.at.1, saved.at.1)
+                && near(actual.size.0, saved.size.0)
+                && near(actual.size.1, saved.size.1)))
+}
+
 /// Warp the pointer and read it back (the compositor applies dispatches in order, but the
 /// read-back is what proves the warp was accepted at all)
 fn warp_pointer(host: &dyn Host, x: i32, y: i32) -> bool {
     for _ in 0..3 {
         let _ = host.send(&Op::MoveCursor { x, y });
-        if host.cursor_pos().is_some_and(|(px, py)| (px - x).abs() <= WARP_TOLERANCE && (py - y).abs() <= WARP_TOLERANCE) {
+        if host.cursor_pos().is_some_and(|(px, py)| {
+            (px - x).abs() <= WARP_TOLERANCE && (py - y).abs() <= WARP_TOLERANCE
+        }) {
             return true;
         }
         host.pause();
@@ -999,6 +1445,38 @@ fn flush_workspace(host: &dyn Host, st: &mut LoadState, key: &WsKey) {
     if held.is_empty() {
         return;
     }
+    if host.merge_existing() {
+        match host.clients() {
+            Ok(live) => {
+                let claimed = st.placer.claimed_addresses();
+                st.foreign = live
+                    .iter()
+                    .filter(|c| c.mapped && !claimed.contains(&c.address))
+                    .map(|c| c.address.clone())
+                    .collect();
+                if shared_workspace(&live, &st.foreign, key) {
+                    for item in held {
+                        if let Some(window) =
+                            live.iter().find(|c| c.mapped && c.address == item.live)
+                        {
+                            apply(host, window, &item.saved);
+                            st.report.placed += 1;
+                        } else {
+                            st.placer.release(item.saved_index);
+                        }
+                    }
+                    return;
+                }
+            }
+            Err(_) => {
+                st.report.incomplete = true;
+                for item in held {
+                    st.placer.release(item.saved_index);
+                }
+                return;
+            }
+        }
+    }
     // The tree is the workspace's whole saved tiled set, so a missing window leaves a hole
     // rather than reshaping the others' order
     let tiled: Vec<usize> = st
@@ -1013,17 +1491,27 @@ fn flush_workspace(host: &dyn Host, st: &mut LoadState, key: &WsKey) {
         .iter()
         .map(|&i| {
             let c = &st.plan.saved[i];
-            (c.at.0 as f64, c.at.1 as f64, (c.at.0 + c.size.0) as f64, (c.at.1 + c.size.1) as f64)
+            (
+                c.at.0 as f64,
+                c.at.1 as f64,
+                f64::from(c.at.0) + f64::from(c.size.0),
+                f64::from(c.at.1) + f64::from(c.size.1),
+            )
         })
         .collect();
 
     let layout = host.option("general:layout");
     let split = host.option("dwindle:force_split");
-    let gaps_out = option_number(host, "general:gaps_out", dwindle::DEFAULT_GAPS_OUT);
     let mut why_not_steered = if layout.as_deref() != Some("dwindle") {
-        Some(format!("layout is {}, not dwindle", layout.as_deref().unwrap_or("unknown")))
+        Some(format!(
+            "layout is {}, not dwindle",
+            layout.as_deref().unwrap_or("unknown")
+        ))
     } else if split.as_deref() != Some("2") {
-        Some(format!("dwindle:force_split is {}, not 2", split.as_deref().unwrap_or("unknown")))
+        Some(format!(
+            "dwindle:force_split is {}, not 2",
+            split.as_deref().unwrap_or("unknown")
+        ))
     } else if st.steering_refused {
         Some("the compositor did not accept a pointer warp".to_string())
     } else {
@@ -1033,7 +1521,9 @@ fn flush_workspace(host: &dyn Host, st: &mut LoadState, key: &WsKey) {
     // Steered: (window position in `tiled`, pointer to warp to first) in insertion order
     let mut schedule: Option<Vec<dwindle::SteerStep>> = None;
     if why_not_steered.is_none() && rects.len() >= 2 {
-        match dwindle::steer_schedule(&rects, gaps_out, dwindle::CUT_TOLERANCE) {
+        // Native dwindle nodes already exclude gaps_out; clients exclude their borders too.
+        let inset = option_number(host, "general:border_size", 1.0);
+        match dwindle::steer_schedule(&rects, inset, dwindle::CUT_TOLERANCE) {
             Err(reason) => why_not_steered = Some(reason),
             Ok(steps) => {
                 // Prove the warp works before the first window moves
@@ -1044,7 +1534,8 @@ fn flush_workspace(host: &dyn Host, st: &mut LoadState, key: &WsKey) {
                 } else {
                     st.steering_refused = true;
                     println!("Warning: the compositor did not take a pointer warp (wanted {x:.0},{y:.0}); not steering");
-                    why_not_steered = Some("the compositor did not accept a pointer warp".to_string());
+                    why_not_steered =
+                        Some("the compositor did not accept a pointer warp".to_string());
                 }
             }
         }
@@ -1055,7 +1546,11 @@ fn flush_workspace(host: &dyn Host, st: &mut LoadState, key: &WsKey) {
     let mut pointers: HashMap<usize, (i32, i32)> = HashMap::new();
     let mut reference_pointer = None;
     if let Some(steps) = &schedule {
-        rank = steps.iter().enumerate().map(|(r, s)| (tiled[s.window], r)).collect();
+        rank = steps
+            .iter()
+            .enumerate()
+            .map(|(r, s)| (tiled[s.window], r))
+            .collect();
         for step in steps {
             if let Some((x, y)) = step.pointer {
                 pointers.insert(tiled[step.window], (x as i32, y as i32));
@@ -1069,61 +1564,152 @@ fn flush_workspace(host: &dyn Host, st: &mut LoadState, key: &WsKey) {
             None => r,
         });
         reference_pointer = pointer;
-        rank = order.iter().enumerate().map(|(r, &pos)| (tiled[pos], r)).collect();
+        rank = order
+            .iter()
+            .enumerate()
+            .map(|(r, &pos)| (tiled[pos], r))
+            .collect();
     }
-    held.sort_by_key(|h| (rank.get(&h.saved_index).copied().unwrap_or(usize::MAX), h.saved_index));
+    held.sort_by_key(|h| {
+        (
+            rank.get(&h.saved_index).copied().unwrap_or(usize::MAX),
+            h.saved_index,
+        )
+    });
 
     let steered = schedule.is_some();
     match (&fallback, steered) {
-        (_, true) => println!("Workspace {}: placing {} tiled windows in steered insertion order (pointer-independent)", key.0, held.len()),
-        (None, false) => println!("Workspace {}: placing {} tiled windows in computed insertion order", key.0, held.len()),
+        (_, true) => println!("Workspace {}: placing {} tiled windows in steered insertion order (pointer-independent)", key, held.len()),
+        (None, false) => println!("Workspace {}: placing {} tiled windows in computed insertion order", key, held.len()),
         (Some(reason), false) => {
-            println!("Workspace {}: placing {} tiled windows in saved reading order ({reason})", key.0, held.len())
+            println!("Workspace {}: placing {} tiled windows in saved reading order ({reason})", key, held.len())
         }
     }
     // The workspace the load started on: its windows were born in its tree in arrival order, among
     // the staged windows of other workspaces that have since left. Moving them all off and back in
     // schedule order, with the pointer steered, rebuilds the tree they were saved in.
-    if steered && Some(key.0) == st.start_ws {
+    if steered {
         let now = host.clients().unwrap_or_default();
-        let here: Vec<&Client> = now.iter().filter(|c| c.mapped && !c.floating && c.workspace.id == key.0).collect();
+        let here: Vec<&Client> = now
+            .iter()
+            .filter(|c| c.mapped && !c.floating && c.workspace.selector() == key.as_str())
+            .collect();
         let mine: HashSet<&Address> = held.iter().map(|h| &h.live).collect();
-        let born_here = here.iter().filter(|c| mine.contains(&c.address)).count();
-        if born_here > 0 {
-            if here.iter().all(|c| mine.contains(&c.address)) {
-                println!("Workspace {}: parking its {born_here} windows to rebuild their tree in order", key.0);
-                for window in here.iter().filter(|c| mine.contains(&c.address)) {
-                    let _ = host.send(&Op::MoveToWorkspace {
-                        window: window.address.clone(),
-                        workspace: crate::dispatch::WorkspaceTarget::Special(STAGE.to_string()),
-                    });
+        if here.iter().any(|c| !mine.contains(&c.address)) {
+            println!("Warning: workspace {key} contains unrelated tiled windows; refusing to rebuild their tree");
+            st.report.incomplete = true;
+            for held in held {
+                if let Some(window) = now.iter().find(|c| c.address == held.live) {
+                    apply(host, window, &held.saved);
+                    st.report.placed += 1;
+                } else {
+                    st.placer.release(held.saved_index);
                 }
-                host.pause();
-            } else {
-                println!(
-                    "Warning: workspace {} holds {} other windows; its tree is left in arrival order",
-                    key.0,
-                    here.len() - born_here
-                );
             }
+            return;
+        }
+        let born_here = here.len();
+        if born_here > 0 {
+            println!(
+                "Workspace {}: parking its {born_here} windows to rebuild their tree in order",
+                key
+            );
+            for window in here {
+                let _ = host.send(&Op::MoveToWorkspace {
+                    window: window.address.clone(),
+                    workspace: crate::dispatch::WorkspaceTarget::Special(STAGE.to_string()),
+                });
+            }
+            host.pause();
         }
     }
     let live = host.clients().unwrap_or_default();
     let count = held.len();
     let mut last_pointer = None;
-    for Held { saved_index, saved, live: address } in held {
+    let mut pointer_moved = false;
+    for Held {
+        saved_index,
+        saved,
+        live: address,
+    } in held
+    {
         match live.iter().find(|c| c.address == address) {
             Some(window) => {
-                if let Some(&(x, y)) = pointers.get(&saved_index) {
+                let split_step = schedule
+                    .as_ref()
+                    .and_then(|steps| rank.get(&saved_index).map(|&r| &steps[r]))
+                    .and_then(|step| step.split.as_ref());
+                let mut split_ready = true;
+                if let Some(split) = split_step {
+                    let anchor = st.placer.targets[tiled[split.anchor]].matched.as_ref();
+                    let current = host.clients().unwrap_or_default();
+                    if let Some(anchor) = anchor.filter(|a| {
+                        current
+                            .iter()
+                            .any(|c| &c.address == *a && c.workspace.selector() == key)
+                    }) {
+                        if host
+                            .send(&Op::FocusWorkspace(key.clone()))
+                            .and_then(|_| host.send(&Op::FocusWindow(anchor.clone())))
+                            .is_err()
+                        {
+                            st.report.incomplete = true;
+                            split_ready = false;
+                        }
+                    } else {
+                        st.report.incomplete = true;
+                        split_ready = false;
+                    }
+                }
+                if let Some(&(x, y)) = pointers.get(&saved_index).filter(|_| split_ready) {
                     if warp_pointer(host, x, y) {
                         last_pointer = Some((x, y));
                     } else {
-                        println!("Warning: pointer warp to {x},{y} was not accepted while placing '{}'", saved.title);
+                        println!(
+                            "Warning: pointer warp to {x},{y} was not accepted while placing '{}'",
+                            saved.title
+                        );
                     }
                 }
                 apply(host, window, &saved);
+                if let (Some((bx, by)), Some((ax, ay))) = (last_pointer, host.cursor_pos()) {
+                    pointer_moved |=
+                        (bx - ax).abs() > WARP_TOLERANCE || (by - ay).abs() > WARP_TOLERANCE;
+                }
+                if let Some(step) = schedule
+                    .as_ref()
+                    .filter(|_| split_ready)
+                    .and_then(|steps| rank.get(&saved_index).map(|&r| &steps[r]))
+                {
+                    if let Some(split) = &step.split {
+                        let anchor = st.placer.targets[tiled[split.anchor]].matched.as_ref();
+                        let current = host.clients().unwrap_or_default();
+                        let first = anchor.and_then(|a| current.iter().find(|c| &c.address == a));
+                        let second = current.iter().find(|c| c.address == address);
+                        if let (Some(first), Some(second)) = (first, second) {
+                            let vertical = first.at.0 != second.at.0;
+                            let result = host
+                                .send(&Op::FocusWorkspace(key.clone()))
+                                .and_then(|_| host.send(&Op::FocusWindow(address.clone())))
+                                .and_then(|_| {
+                                    if vertical != (split.orient == dwindle::Orient::V) {
+                                        host.send(&Op::Layout("togglesplit".into()))?;
+                                    }
+                                    host.send(&Op::Layout(format!(
+                                        "splitratio {} exact",
+                                        split.ratio
+                                    )))
+                                });
+                            if result.is_err() {
+                                st.report.incomplete = true;
+                            }
+                            last_pointer = host.cursor_pos();
+                        } else {
+                            st.report.incomplete = true;
+                        }
+                    }
+                }
                 st.report.placed += 1;
-                st.placed_tiled.push((address, saved_index));
             }
             None => {
                 println!("Warning: '{}' vanished before it was placed", saved.title);
@@ -1133,24 +1719,32 @@ fn flush_workspace(host: &dyn Host, st: &mut LoadState, key: &WsKey) {
     }
 
     // The pointer is only suspect if something other than the loader moved it
-    let pointer_moved = match (last_pointer.or(reference_pointer), host.cursor_pos()) {
-        (Some((bx, by)), Some((ax, ay))) => (bx - ax).abs() > WARP_TOLERANCE || (by - ay).abs() > WARP_TOLERANCE,
-        _ => false,
-    };
+    let pointer_moved = pointer_moved
+        || match (last_pointer.or(reference_pointer), host.cursor_pos()) {
+            (Some((bx, by)), Some((ax, ay))) => {
+                (bx - ax).abs() > WARP_TOLERANCE || (by - ay).abs() > WARP_TOLERANCE
+            }
+            _ => false,
+        };
     if pointer_moved {
-        println!("Warning: the pointer moved while workspace {} was placed; its order may not have been reproduced", key.0);
+        println!("Warning: the pointer moved while workspace {} was placed; its order may not have been reproduced", key);
     }
 
-    st.report.flushes.push(FlushReport { workspace: key.0, windows: count, fallback, steered, pointer_moved });
+    st.report.flushes.push(FlushReport {
+        workspace: key.clone(),
+        windows: count,
+        fallback,
+        steered,
+        pointer_moved,
+    });
 }
 
 /// Flush every workspace whose queue is ready. The workspace the load started on waits for the
 /// end: windows are born on it, so it can only be rebuilt once the other workspaces have taken
 /// their staged windows away.
 fn flush_ready(host: &dyn Host, st: &mut LoadState) {
-    let deferred = if st.queue.is_launching() { st.start_ws } else { None };
     for key in st.queue.ready() {
-        if Some(key.0) != deferred {
+        if !st.queue.is_launching() || Some(key.as_str()) != st.start_ws.as_deref() {
             flush_workspace(host, st, &key);
         }
     }
@@ -1159,7 +1753,7 @@ fn flush_ready(host: &dyn Host, st: &mut LoadState) {
 fn flush_all(host: &dyn Host, st: &mut LoadState) {
     let mut keys = st.queue.all_held();
     // the start workspace last
-    keys.sort_by_key(|k| Some(k.0) == st.start_ws);
+    keys.sort_by_key(|k| Some(k.as_str()) == st.start_ws.as_deref());
     for key in keys {
         flush_workspace(host, st, &key);
     }
@@ -1167,34 +1761,80 @@ fn flush_all(host: &dyn Host, st: &mut LoadState) {
 
 /// Place every live window that claims a saved client; returns the windows claimed now.
 /// Tiled claims are held and placed together once their workspace is ready.
-fn place_live(host: &dyn Host, st: &mut LoadState, live: &[Client], phase: Option<Phase>) -> Vec<Address> {
+fn place_live(
+    host: &dyn Host,
+    st: &mut LoadState,
+    live: &[Client],
+    phase: Option<Phase>,
+) -> Vec<Address> {
+    if host.merge_existing() {
+        st.owners.clear();
+        let mut excluded = st.protected.clone();
+        excluded.extend(st.placer.claimed_addresses());
+        st.initial = merge_candidates(host, st.plan, live, &excluded, &st.signatures);
+    }
     attribute_owners(host, st, live);
+    if host.merge_existing() {
+        let claimed = st.placer.claimed_addresses();
+        st.foreign = live
+            .iter()
+            .filter(|c| {
+                c.mapped
+                    && !claimed.contains(&c.address)
+                    && !st.initial.contains_key(&c.address)
+                    && !st.owners.contains_key(&c.address)
+            })
+            .map(|c| c.address.clone())
+            .collect();
+    }
     let mut claimed = vec![];
-    for window in live.iter().filter(|c| c.mapped && !st.protected.contains(&c.address)) {
+    for window in live
+        .iter()
+        .filter(|c| c.mapped && !st.protected.contains(&c.address))
+    {
         // Bound by provenance when /proc proves whose window it is, else by the resume phase
-        let owned: Vec<usize> = st
+        let owned: &[usize] = st
             .owners
             .get(&window.address)
             .and_then(|&i| st.plan.entries[i].group.as_ref())
-            .map(|g| g.saved.clone())
+            .map(|g| g.saved.as_slice())
             .unwrap_or_default();
-        let own: &[usize] = if !owned.is_empty() {
-            &owned
+        let assignment = if !owned.is_empty() {
+            st.placer.assign_proven(window, owned)
+        } else if let Some(&index) = st.initial.get(&window.address) {
+            st.placer.assign_proven(window, &[index])
+        } else if host.merge_existing() {
+            None
         } else {
-            match phase {
+            let own = match phase {
                 Some(p) if !p.before.contains(&window.address) => p.own,
                 _ => &[],
-            }
+            };
+            st.placer.assign_bound(window, own, &st.reserved)
         };
-        if let Some((saved_index, wanted)) = st.placer.assign_bound(window, own, &st.reserved) {
-            if st.queue.holds(&wanted) {
-                st.queue.hold(Held { saved_index, saved: wanted, live: window.address.clone() });
+        if let Some((saved_index, wanted)) = assignment {
+            st.foreign.remove(&window.address);
+            if st.queue.holds(&wanted)
+                && !shared_workspace(live, &st.foreign, wanted.workspace.selector())
+            {
+                // Keep new arrivals out of every workspace's partially reconstructed tree.
+                if host
+                    .send(&Op::MoveToWorkspace {
+                        window: window.address.clone(),
+                        workspace: crate::dispatch::WorkspaceTarget::Special(STAGE.into()),
+                    })
+                    .is_err()
+                {
+                    st.report.incomplete = true;
+                }
+                st.queue.hold(Held {
+                    saved_index,
+                    saved: wanted,
+                    live: window.address.clone(),
+                });
             } else {
                 apply(host, window, &wanted);
                 st.report.placed += 1;
-                if crate::queue::is_queued(&wanted) {
-                    st.placed_tiled.push((window.address.clone(), saved_index));
-                }
             }
             claimed.push(window.address.clone());
         }
@@ -1251,7 +1891,10 @@ fn fulfil_group(
         let bound = expected.saturating_sub(claimed);
         while reinvocations < bound && claimed < expected {
             reinvocations += 1;
-            println!("'{}': {claimed} of {expected} windows; launching it again", group.label);
+            println!(
+                "'{}': {claimed} of {expected} windows; launching it again",
+                group.label
+            );
             if host.send(&Op::Exec(entry.command.clone())).is_err() {
                 break;
             }
@@ -1272,39 +1915,186 @@ fn fulfil_group(
     }
 }
 
+/// Independent GUI launches share one wait budget; a slow app cannot serialize the others.
+fn launch_grouped(host: &dyn Host, st: &mut LoadState) {
+    let plan = st.plan;
+    #[derive(Default)]
+    struct Progress {
+        count: usize,
+        stable: u64,
+        reinvocations: usize,
+        limit: Option<usize>,
+        done: bool,
+        tray_checked: bool,
+    }
+    let mut progress: Vec<Progress> = st
+        .plan
+        .entries
+        .iter()
+        .map(|_| Progress::default())
+        .collect();
+    for (index, entry) in plan.entries.iter().enumerate() {
+        if let Ok(live) = host.clients() {
+            place_live(host, st, &live, None);
+        }
+        st.launched = index + 1;
+        let group = entry.group.as_ref().expect("grouped launches");
+        if group
+            .saved
+            .iter()
+            .all(|&i| st.placer.targets[i].matched.is_some())
+        {
+            progress[index].done = true;
+            st.queue.entry_done(&st.plan.saved, entry);
+        } else if let Err(error) = host.send(&Op::Exec(entry.command.clone())) {
+            println!("Warning: failed to launch '{}': {error}", entry.command);
+            progress[index].done = true;
+            st.queue.entry_done(&st.plan.saved, entry);
+        }
+    }
+    st.queue.launches_sent();
+    for _ in 0..LAUNCH_WAIT_TICKS.max(st.plan.tail_ticks) {
+        host.pause();
+        if let Ok(live) = host.clients() {
+            place_live(host, st, &live, None);
+        }
+        for (index, (entry, state)) in st.plan.entries.iter().zip(&mut progress).enumerate() {
+            let group = entry.group.as_ref().expect("grouped launches");
+            let count = group
+                .saved
+                .iter()
+                .filter(|&&i| st.placer.targets[i].matched.is_some())
+                .count();
+            if count == group.saved.len() {
+                if !state.done {
+                    st.queue.entry_done(&st.plan.saved, entry);
+                    state.done = true;
+                }
+            } else if !state.done {
+                state.stable = if count == state.count {
+                    state.stable + 1
+                } else {
+                    0
+                };
+                if count == 0 && state.stable >= SETTLE_TICKS && !state.tray_checked {
+                    state.tray_checked = true;
+                    if let Some(signature) = &st.signatures[index] {
+                        let unique = st
+                            .signatures
+                            .iter()
+                            .filter(|s| s.as_ref() == Some(signature))
+                            .count()
+                            == 1;
+                        if unique && host.reveal_tray_window(entry) {
+                            println!(
+                                "Revealing saved GUI from verified tray process: '{}'",
+                                group.label
+                            );
+                        }
+                    }
+                }
+                if count > 0 && state.stable >= SETTLE_TICKS {
+                    let limit = *state.limit.get_or_insert(group.saved.len() - count);
+                    if state.reinvocations < limit {
+                        let _ = host.send(&Op::Exec(entry.command.clone()));
+                        state.reinvocations += 1;
+                        state.stable = 0;
+                    }
+                }
+            }
+            state.count = count;
+        }
+        flush_ready(host, st);
+        if st.placer.is_complete() {
+            break;
+        }
+    }
+    for (entry, state) in st.plan.entries.iter().zip(progress) {
+        let group = entry.group.as_ref().expect("grouped launches");
+        if state.count < group.saved.len() {
+            st.report.shortfalls.push(GroupShortfall {
+                label: group.label.clone(),
+                expected: group.saved.len(),
+                got: state.count,
+                reinvocations: state.reinvocations,
+            });
+        }
+    }
+}
+
 /// Run a load: launch each entry in order waiting for its window, claiming windows as
 /// they appear, then keep claiming until everything saved is matched or time runs out.
 /// Tiled windows are placed per workspace (see `PlacementQueue`); floating ones on claim.
 pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
-    let protected: HashSet<Address> = match plan.scope {
-        Some(workspace) => host
-            .clients()
-            .map(|c| c.into_iter().filter(|c| c.workspace.id != workspace).map(|c| c.address).collect())
-            .unwrap_or_default(),
-        None => HashSet::new(),
+    let initial_live = if host.merge_existing() || plan.scope.is_some() {
+        match host.clients() {
+            Ok(clients) => clients,
+            Err(_) => {
+                return LoadReport {
+                    unmatched: plan.saved.clone(),
+                    incomplete: true,
+                    ..LoadReport::default()
+                }
+            }
+        }
+    } else {
+        Vec::new()
     };
+    let protected: HashSet<Address> = initial_live
+        .iter()
+        .filter(|c| {
+            plan.scope
+                .as_ref()
+                .is_some_and(|workspace| !c.workspace.matches_selector(workspace))
+        })
+        .map(|c| c.address.clone())
+        .collect();
+    let initial = HashMap::new();
+    let foreign = HashSet::new();
     let mut st = LoadState {
         plan,
-        placer: Placer::new(if plan.place_by_class { plan.saved.clone() } else { vec![] }),
-        queue: if plan.place_by_class { PlacementQueue::new(&plan.saved, &plan.entries) } else { PlacementQueue::disabled() },
+        placer: Placer::new(if plan.place_by_class {
+            plan.saved.clone()
+        } else {
+            vec![]
+        }),
+        queue: if plan.place_by_class {
+            PlacementQueue::new(&plan.saved, &plan.entries)
+        } else {
+            PlacementQueue::disabled()
+        },
         protected,
-        pointer_home: if plan.place_by_class { host.pointer_origin() } else { None },
+        initial,
+        foreign,
+        pointer_home: if plan.place_by_class {
+            host.pointer_origin()
+        } else {
+            None
+        },
         pointer_moved_by_us: false,
         steering_refused: false,
-        start_ws: if plan.place_by_class { host.active_workspace() } else { None },
+        start_ws: if plan.place_by_class {
+            host.active_workspace()
+        } else {
+            None
+        },
         launched: 0,
         signatures: plan.entries.iter().map(entry_signature).collect(),
         owners: HashMap::new(),
-        placed_tiled: vec![],
         reserved: if plan.place_by_class {
-            plan.entries.iter().filter(|e| is_resume_entry(e)).filter_map(|e| e.group.as_ref()).flat_map(|g| g.saved.iter().copied()).collect()
+            plan.entries
+                .iter()
+                .filter(|e| is_resume_entry(e))
+                .filter_map(|e| e.group.as_ref())
+                .flat_map(|g| g.saved.iter().copied())
+                .collect()
         } else {
             HashSet::new()
         },
         report: LoadReport::default(),
     };
     if plan.place_by_class {
-        if let Some(ws) = st.start_ws {
+        if let Some(ws) = &st.start_ws {
             println!("Start workspace: {ws} (windows destined for it are born there and are rebuilt in order at the end)");
         }
         match st.pointer_home {
@@ -1312,51 +2102,111 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
             None => println!("Pointer at load start: unknown (it will not be restored)"),
         }
     }
-
-    for (index, entry) in plan.entries.iter().enumerate() {
-        let before: HashSet<Address> = host
-            .clients()
-            .map(|c| c.into_iter().map(|c| c.address).collect())
-            .unwrap_or_default();
-        st.launched = index + 1;
-        if let Err(e) = host.send(&Op::Exec(entry.command.clone())) {
-            println!("Warning: failed to launch '{}': {e}", entry.command);
-            st.queue.entry_done(&plan.saved, entry);
-            flush_ready(host, &mut st);
-            continue;
+    if host.merge_existing() && plan.place_by_class {
+        match host.clients() {
+            Ok(live) => {
+                place_live(host, &mut st, &live, None);
+            }
+            Err(_) => {
+                return LoadReport {
+                    unmatched: plan.saved.clone(),
+                    incomplete: true,
+                    ..LoadReport::default()
+                };
+            }
         }
-        let mut claimed = 0;
-        for _ in 0..LAUNCH_WAIT_TICKS {
-            host.pause();
-            let Ok(live) = host.clients() else { continue };
-            if plan.place_by_class {
-                let own = own_saves(entry);
-                claimed += place_live(host, &mut st, &live, Some(Phase { before: &before, own }))
+    }
+
+    let concurrent = plan.place_by_class
+        && !plan.entries.is_empty()
+        && plan
+            .entries
+            .iter()
+            .all(|entry| entry.group.is_some() && !is_resume_entry(entry));
+    if concurrent {
+        launch_grouped(host, &mut st);
+    } else {
+        for (index, entry) in plan.entries.iter().enumerate() {
+            if host.merge_existing() && plan.place_by_class {
+                if let Ok(live) = host.clients() {
+                    place_live(host, &mut st, &live, None);
+                }
+            }
+            if host.merge_existing()
+                && entry.group.as_ref().is_some_and(|group| {
+                    group
+                        .saved
+                        .iter()
+                        .all(|&i| st.placer.targets[i].matched.is_some())
+                })
+            {
+                st.queue.entry_done(&plan.saved, entry);
+                continue;
+            }
+            let before: HashSet<Address> = host
+                .clients()
+                .map(|c| c.into_iter().map(|c| c.address).collect())
+                .unwrap_or_default();
+            st.launched = index + 1;
+            if let Err(e) = host.send(&Op::Exec(entry.command.clone())) {
+                println!("Warning: failed to launch '{}': {e}", entry.command);
+                st.queue.entry_done(&plan.saved, entry);
+                flush_ready(host, &mut st);
+                continue;
+            }
+            let mut claimed = if host.merge_existing() {
+                entry.group.as_ref().map_or(0, |group| {
+                    group
+                        .saved
+                        .iter()
+                        .filter(|&&i| st.placer.targets[i].matched.is_some())
+                        .count()
+                })
+            } else {
+                0
+            };
+            for _ in 0..LAUNCH_WAIT_TICKS {
+                host.pause();
+                let Ok(live) = host.clients() else { continue };
+                if plan.place_by_class {
+                    let own = own_saves(entry);
+                    claimed += place_live(
+                        host,
+                        &mut st,
+                        &live,
+                        Some(Phase {
+                            before: &before,
+                            own,
+                        }),
+                    )
                     .into_iter()
                     .filter(|a| !before.contains(a) && counts_for(&st, a, index))
                     .count();
-            }
-            // a window that /proc shows belongs to another entry is not the one being waited for
-            let new_window =
-                live.iter().find(|c| c.mapped && !before.contains(&c.address) && counts_for(&st, &c.address, index));
-            if let Some(window) = new_window {
-                if !plan.place_by_class {
-                    apply(host, window, &desired_from_rules(window, &entry.rules));
-                    st.report.placed += 1;
                 }
-                break;
+                // a window that /proc shows belongs to another entry is not the one being waited for
+                let new_window = live.iter().find(|c| {
+                    c.mapped && !before.contains(&c.address) && counts_for(&st, &c.address, index)
+                });
+                if let Some(window) = new_window {
+                    if !plan.place_by_class {
+                        apply(host, window, &desired_from_rules(window, &entry.rules));
+                        st.report.placed += 1;
+                    }
+                    break;
+                }
             }
+            if let (true, Some(group)) = (plan.place_by_class, entry.group.as_ref()) {
+                fulfil_group(host, &mut st, entry, index, group, &before, claimed);
+            }
+            st.queue.entry_done(&plan.saved, entry);
+            flush_ready(host, &mut st);
         }
-        if let (true, Some(group)) = (plan.place_by_class, entry.group.as_ref()) {
-            fulfil_group(host, &mut st, entry, index, group, &before, claimed);
-        }
-        st.queue.entry_done(&plan.saved, entry);
-        flush_ready(host, &mut st);
     }
 
     if plan.place_by_class {
         let mut ticks = 0;
-        while !st.placer.is_complete() && ticks < plan.tail_ticks {
+        let tail_ticks = if concurrent { 0 } else { plan.tail_ticks };
+        while !st.placer.is_complete() && ticks < tail_ticks {
             host.pause();
             ticks += 1;
             if let Ok(live) = host.clients() {
@@ -1367,20 +2217,25 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
         flush_all(host, &mut st);
         st.report.unmatched = st.placer.unmatched().into_iter().cloned().collect();
         for client in &st.report.unmatched {
-            println!("Warning: no window appeared for saved client '{}' ({})", client.title, client.class);
+            println!(
+                "Warning: no window appeared for saved client '{}' ({})",
+                client.title, client.class
+            );
         }
         if let Ok(live) = host.clients() {
             let claimed = st.placer.claimed_addresses();
             st.report.surplus = live
                 .into_iter()
-                .filter(|c| c.mapped && !claimed.contains(&c.address) && !st.protected.contains(&c.address))
+                .filter(|c| {
+                    c.mapped && !claimed.contains(&c.address) && !st.protected.contains(&c.address)
+                })
                 .collect();
         }
     }
 
     // Focus first: changing workspace can itself move the pointer, so the pointer goes back last
-    if let Some(workspace) = plan.restore_workspace {
-        let _ = host.send(&Op::FocusWorkspace(workspace));
+    if let Some(workspace) = &plan.restore_workspace {
+        let _ = host.send(&Op::FocusWorkspace(workspace.clone()));
     }
     if st.pointer_moved_by_us {
         match st.pointer_home {
@@ -1388,46 +2243,125 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
                 if warp_pointer(host, x, y) {
                     println!("Pointer restored to {x},{y}");
                 } else {
-                    println!("Warning: could not put the pointer back at {x},{y} (now at {:?})", host.cursor_pos());
+                    println!(
+                        "Warning: could not put the pointer back at {x},{y} (now at {:?})",
+                        host.cursor_pos()
+                    );
                 }
             }
-            None => println!("Warning: the pointer was steered but its starting position was unknown"),
+            None => {
+                println!("Warning: the pointer was steered but its starting position was unknown")
+            }
         }
     }
     verify_final_geometry(host, &mut st);
     st.report
 }
 
-/// Once, after every placement is done: read the compositor's final geometry back and compare each
-/// placed tiled window with its save, per workspace. Earlier reads are mid-assembly (a workspace
-/// that is still filling reads wrong; one that reads right can be broken by a later arrival).
+/// Verify the final compositor state, not merely successful dispatch replies.
 fn verify_final_geometry(host: &dyn Host, st: &mut LoadState) {
-    if st.placed_tiled.is_empty() {
+    if !st.plan.place_by_class || st.report.placed == 0 {
         return;
     }
     host.pause();
     host.pause();
-    let Ok(after) = host.clients() else { return };
-    let mut by_ws: std::collections::BTreeMap<i32, WorkspaceCheck> = Default::default();
-    for (address, index) in &st.placed_tiled {
-        let saved = &st.plan.saved[*index];
-        let check = by_ws.entry(saved.workspace.id).or_insert(WorkspaceCheck {
-            workspace: saved.workspace.id,
-            at_saved: 0,
-            checked: 0,
-            off: vec![],
-        });
+    let Ok(mut after) = host.clients() else {
+        st.report.incomplete = true;
+        return;
+    };
+    let mut live: HashMap<_, _> = after.iter().map(|c| (&c.address, c)).collect();
+    // Applications can deliver their initial maximize request after mapping and
+    // placement. Finalize the saved state once those startup configures settle.
+    let mut finalized = false;
+    for target in &st.placer.targets {
+        let Some(address) = &target.matched else {
+            continue;
+        };
+        if let Some(actual) = live
+            .get(address)
+            .filter(|c| c.mapped && c.fullscreen != target.saved.fullscreen)
+        {
+            apply(host, actual, &target.saved);
+            finalized = true;
+        }
+    }
+    if finalized {
+        host.pause();
+        let Ok(current) = host.clients() else {
+            st.report.incomplete = true;
+            return;
+        };
+        drop(live);
+        after = current;
+        live = after.iter().map(|c| (&c.address, c)).collect();
+    }
+    // Await configure/animation completion, without relaunching or redispatching.
+    for _ in 0..(2 * TICKS_PER_SECOND) {
+        if host.merge_existing() {
+            let claimed = st.placer.claimed_addresses();
+            st.foreign = after
+                .iter()
+                .filter(|c| c.mapped && !claimed.contains(&c.address))
+                .map(|c| c.address.clone())
+                .collect();
+        }
+        if st.placer.targets.iter().all(|target| {
+            target.matched.as_ref().is_none_or(|address| {
+                live.get(address).is_some_and(|actual| {
+                    window_at_saved_state(
+                        actual,
+                        &target.saved,
+                        shared_workspace(&after, &st.foreign, target.saved.workspace.selector()),
+                    )
+                })
+            })
+        }) {
+            break;
+        }
+        host.pause();
+        let Ok(current) = host.clients() else {
+            st.report.incomplete = true;
+            return;
+        };
+        drop(live);
+        after = current;
+        live = after.iter().map(|c| (&c.address, c)).collect();
+    }
+    if host.merge_existing() {
+        let claimed = st.placer.claimed_addresses();
+        st.foreign = after
+            .iter()
+            .filter(|c| c.mapped && !claimed.contains(&c.address))
+            .map(|c| c.address.clone())
+            .collect();
+    }
+    let mut by_ws: std::collections::BTreeMap<&str, WorkspaceCheck> = Default::default();
+    for target in &st.placer.targets {
+        let Some(address) = &target.matched else {
+            continue;
+        };
+        let saved = &target.saved;
+        let check = by_ws
+            .entry(saved.workspace.selector())
+            .or_insert_with(|| WorkspaceCheck {
+                workspace: saved.workspace.selector().to_owned(),
+                at_saved: 0,
+                checked: 0,
+                off: vec![],
+            });
         check.checked += 1;
-        let ok = after.iter().find(|c| c.address == *address).is_some_and(|c| {
-            (c.at.0 as i32 - saved.at.0 as i32).abs() <= GEOMETRY_TOLERANCE
-                && (c.at.1 as i32 - saved.at.1 as i32).abs() <= GEOMETRY_TOLERANCE
-                && (c.size.0 as i32 - saved.size.0 as i32).abs() <= GEOMETRY_TOLERANCE
-                && (c.size.1 as i32 - saved.size.1 as i32).abs() <= GEOMETRY_TOLERANCE
+        let ok = live.get(address).is_some_and(|actual| {
+            window_at_saved_state(
+                actual,
+                saved,
+                shared_workspace(&after, &st.foreign, saved.workspace.selector()),
+            )
         });
         if ok {
             check.at_saved += 1;
         } else {
             check.off.push(saved.title.clone());
+            st.report.incomplete = true;
         }
     }
     st.report.verification = by_ws.into_values().collect();
@@ -1456,18 +2390,35 @@ mod tests {
     #[test]
     fn test_parse_exec_line_edge_cases() {
         // Brackets inside the command are not mistaken for the end of the rules
-        assert_eq!(parse_exec_line("[workspace 1 silent] sh -c 'echo [x]'").unwrap().command, "sh -c 'echo [x]'");
-        assert_eq!(parse_exec_line("[] true").unwrap().rules, ExecRules::default());
+        assert_eq!(
+            parse_exec_line("[workspace 1 silent] sh -c 'echo [x]'")
+                .unwrap()
+                .command,
+            "sh -c 'echo [x]'"
+        );
+        assert_eq!(
+            parse_exec_line("[] true").unwrap().rules,
+            ExecRules::default()
+        );
         assert_eq!(parse_exec_line("true").unwrap().command, "true");
         assert_eq!(
-            parse_exec_line("[workspace special silent] x").unwrap().rules.workspace,
+            parse_exec_line("[workspace special silent] x")
+                .unwrap()
+                .rules
+                .workspace,
             Some(RuleWorkspace::Special(None))
         );
         assert_eq!(
-            parse_exec_line("[workspace special:scratch silent] x").unwrap().rules.workspace,
+            parse_exec_line("[workspace special:scratch silent] x")
+                .unwrap()
+                .rules
+                .workspace,
             Some(RuleWorkspace::Special(Some("scratch".to_string())))
         );
-        assert_eq!(parse_exec_line("[someday 4] x").unwrap().rules.unknown, vec!["someday 4"]);
+        assert_eq!(
+            parse_exec_line("[someday 4] x").unwrap().rules.unknown,
+            vec!["someday 4"]
+        );
     }
 
     #[test]
@@ -1480,7 +2431,13 @@ mod tests {
         assert!(err.contains("line 3"), "{err}");
     }
 
-    fn saved(class: &str, argv: Option<&[&str]>, ws: i32, floating: bool, at: (i16, i16)) -> SavedClient {
+    fn saved(
+        class: &str,
+        argv: Option<&[&str]>,
+        ws: i32,
+        floating: bool,
+        at: (i32, i32),
+    ) -> SavedClient {
         SavedClient {
             client: client(class, "t", ws, floating, at, (100, 50)),
             argv: argv.map(|a| a.iter().map(|s| s.to_string()).collect()),
@@ -1492,19 +2449,40 @@ mod tests {
     #[test]
     fn test_launch_entries_from_saved_argv() {
         let entries = launch_entries_from_saved_no_xdg(&[
-            saved("brave", Some(&["/opt/brave/brave", "--app=https://example.test/a b"]), 5, false, (0, 0)),
+            saved(
+                "brave",
+                Some(&["/opt/brave/brave", "--app=https://example.test/a b"]),
+                5,
+                false,
+                (0, 0),
+            ),
             // Another window of the same process: same command, not launched again
-            saved("brave", Some(&["/opt/brave/brave", "--app=https://example.test/a b"]), 6, true, (9, 9)),
+            saved(
+                "brave",
+                Some(&["/opt/brave/brave", "--app=https://example.test/a b"]),
+                6,
+                true,
+                (9, 9),
+            ),
             // A second instance with its own profile is a distinct launch
-            saved("brave", Some(&["/opt/brave/brave", "--user-data-dir=/home/x/p"]), 1, false, (3, 4)),
+            saved(
+                "brave",
+                Some(&["/opt/brave/brave", "--user-data-dir=/home/x/p"]),
+                1,
+                false,
+                (3, 4),
+            ),
             // No argv: cannot be launched
             saved("ghost", None, 2, false, (0, 0)),
         ]);
         let commands: Vec<&str> = entries.iter().map(|e| e.command.as_str()).collect();
-        assert_eq!(commands, vec![
-            "/opt/brave/brave '--app=https://example.test/a b'",
-            "/opt/brave/brave --user-data-dir=/home/x/p",
-        ]);
+        assert_eq!(
+            commands,
+            vec![
+                "/opt/brave/brave '--app=https://example.test/a b'",
+                "/opt/brave/brave --user-data-dir=/home/x/p",
+            ]
+        );
         // Rules come from the first window carrying each command
         assert_eq!(entries[0].rules.workspace, Some(RuleWorkspace::Id(5)));
         assert!(!entries[0].rules.float);
@@ -1515,7 +2493,7 @@ mod tests {
         launch_entries_from_saved(saved, &HashMap::new())
     }
 
-    fn saved_pid(class: &str, argv: &[&str], pid: i32, at: (i16, i16)) -> SavedClient {
+    fn saved_pid(class: &str, argv: &[&str], pid: i32, at: (i32, i32)) -> SavedClient {
         let mut window = saved(class, Some(argv), 1, false, at);
         window.client.pid = pid;
         window
@@ -1525,7 +2503,8 @@ mod tests {
     fn test_single_element_argv_is_used_verbatim() {
         // Chromium-family cmdline: one space-joined string with shell quotes embedded
         let blob = r#"/opt/electronmail/electron-mail --class=electron-mail --name="Electron Mail" --user-data-dir='/home/x/em data'"#;
-        let entries = launch_entries_from_saved_no_xdg(&[saved_pid("electron-mail", &[blob], 7, (0, 0))]);
+        let entries =
+            launch_entries_from_saved_no_xdg(&[saved_pid("electron-mail", &[blob], 7, (0, 0))]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].command, blob);
         // Multi-element argv is still shell-joined
@@ -1565,7 +2544,12 @@ mod tests {
             crate::command_faker::xdg_id_key("dev.vencord.vesktop"),
             "/usr/bin/flatpak run --command=vesktop dev.vencord.Vesktop".to_string(),
         );
-        let mut vesktop = saved_pid("dev.vencord.Vesktop", &["/app/bin/vesktop/vesktop.bin --no-sandbox"], 40, (0, 0));
+        let mut vesktop = saved_pid(
+            "dev.vencord.Vesktop",
+            &["/app/bin/vesktop/vesktop.bin --no-sandbox"],
+            40,
+            (0, 0),
+        );
         vesktop.client.initial_class = "dev.vencord.Vesktop".to_string();
         let mut vesktop2 = vesktop.clone();
         vesktop2.client.pid = 41;
@@ -1573,18 +2557,29 @@ mod tests {
         let entries = launch_entries_from_saved(&[vesktop.clone(), vesktop2, host_app], &xdg);
         let commands: Vec<&str> = entries.iter().map(|e| e.command.as_str()).collect();
         // The entry command replaces the blob; multiplicity is still per pid; the host app is untouched
-        assert_eq!(commands, vec![
-            "/usr/bin/flatpak run --command=vesktop dev.vencord.Vesktop",
-            "/usr/bin/flatpak run --command=vesktop dev.vencord.Vesktop",
-            "/usr/bin/kitty --single-instance",
-        ]);
+        assert_eq!(
+            commands,
+            vec![
+                "/usr/bin/flatpak run --command=vesktop dev.vencord.Vesktop",
+                "/usr/bin/flatpak run --command=vesktop dev.vencord.Vesktop",
+                "/usr/bin/kitty --single-instance",
+            ]
+        );
         // Multi-element sandbox argv is recognised too
-        let multi = saved_pid("dev.vencord.Vesktop", &["/app/bin/vesktop", "--x"], 43, (0, 0));
+        let multi = saved_pid(
+            "dev.vencord.Vesktop",
+            &["/app/bin/vesktop", "--x"],
+            43,
+            (0, 0),
+        );
         let entries = launch_entries_from_saved(&[multi], &xdg);
         assert!(entries[0].command.starts_with("/usr/bin/flatpak run"));
         // With no desktop entry the recorded command is kept
         let entries = launch_entries_from_saved(&[vesktop], &HashMap::new());
-        assert_eq!(entries[0].command, "/app/bin/vesktop/vesktop.bin --no-sandbox");
+        assert_eq!(
+            entries[0].command,
+            "/app/bin/vesktop/vesktop.bin --no-sandbox"
+        );
     }
 
     fn saved_cwd(argv: &[&str], pid: i32, cwd: Option<&str>) -> SavedClient {
@@ -1599,9 +2594,17 @@ mod tests {
         let entries = launch_entries_with(
             &[
                 // The playcall pattern: a relative-path launch
-                saved_cwd(&["./playcall-gui"], 1, Some("/home/synthetic/Work/playcall-gui")),
+                saved_cwd(
+                    &["./playcall-gui"],
+                    1,
+                    Some("/home/synthetic/Work/playcall-gui"),
+                ),
                 // Not only relative launches (DEC-1), and paths needing quoting
-                saved_cwd(&["/usr/bin/kitty", "--single-instance"], 2, Some("/home/synthetic/my dir")),
+                saved_cwd(
+                    &["/usr/bin/kitty", "--single-instance"],
+                    2,
+                    Some("/home/synthetic/my dir"),
+                ),
                 // Legacy: no recorded cwd launches exactly as in v1
                 saved_cwd(&["mpv"], 3, None),
             ],
@@ -1610,17 +2613,25 @@ mod tests {
             &ResumeConfig::default(),
         );
         let commands: Vec<&str> = entries.iter().map(|e| e.command.as_str()).collect();
-        assert_eq!(commands, vec![
-            "cd /home/synthetic/Work/playcall-gui && ./playcall-gui",
-            "cd '/home/synthetic/my dir' && /usr/bin/kitty --single-instance",
-            "mpv",
-        ]);
+        assert_eq!(
+            commands,
+            vec![
+                "cd /home/synthetic/Work/playcall-gui && ./playcall-gui",
+                "cd '/home/synthetic/my dir' && /usr/bin/kitty --single-instance",
+                "mpv",
+            ]
+        );
     }
 
     #[test]
     fn test_missing_cwd_launches_unwrapped() {
         let gone = |_: &Path| false;
-        let entries = launch_entries_with(&[saved_cwd(&["./playcall-gui"], 1, Some("/gone"))], &HashMap::new(), &gone, &ResumeConfig::default());
+        let entries = launch_entries_with(
+            &[saved_cwd(&["./playcall-gui"], 1, Some("/gone"))],
+            &HashMap::new(),
+            &gone,
+            &ResumeConfig::default(),
+        );
         assert_eq!(entries[0].command, "./playcall-gui");
     }
 
@@ -1635,7 +2646,10 @@ mod tests {
         vesktop.client.initial_class = "dev.vencord.Vesktop".to_string();
         let exists = |_: &Path| true;
         let entries = launch_entries_with(&[vesktop], &xdg, &exists, &ResumeConfig::default());
-        assert_eq!(entries[0].command, "/usr/bin/flatpak run dev.vencord.Vesktop");
+        assert_eq!(
+            entries[0].command,
+            "/usr/bin/flatpak run dev.vencord.Vesktop"
+        );
     }
 
     #[test]
@@ -1645,23 +2659,39 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         let script = project.path().join("playcall-gui");
         std::fs::write(&script, "#!/bin/sh\npwd > ran-from\n").unwrap();
-        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         let exists = |p: &Path| p.is_dir();
         let entries = launch_entries_with(
-            &[saved_cwd(&["./playcall-gui"], 1, Some(project.path().to_str().unwrap()))],
+            &[saved_cwd(
+                &["./playcall-gui"],
+                1,
+                Some(project.path().to_str().unwrap()),
+            )],
             &HashMap::new(),
             &exists,
             &ResumeConfig::default(),
         );
         let status = std::process::Command::new("sh")
-            .arg("-c").arg(&entries[0].command).current_dir(elsewhere.path()).status().unwrap();
+            .arg("-c")
+            .arg(&entries[0].command)
+            .current_dir(elsewhere.path())
+            .status()
+            .unwrap();
         assert!(status.success());
         let ran_from = std::fs::read_to_string(project.path().join("ran-from")).unwrap();
-        assert_eq!(std::fs::canonicalize(ran_from.trim()).unwrap(), std::fs::canonicalize(project.path()).unwrap());
+        assert_eq!(
+            std::fs::canonicalize(ran_from.trim()).unwrap(),
+            std::fs::canonicalize(project.path()).unwrap()
+        );
 
         // Without the wrap the same launch fails from the loader's directory
-        let bare = std::process::Command::new("sh").arg("-c").arg("./playcall-gui")
-            .current_dir(elsewhere.path()).output().unwrap();
+        let bare = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("./playcall-gui")
+            .current_dir(elsewhere.path())
+            .output()
+            .unwrap();
         assert!(!bare.status.success());
     }
 
@@ -1669,7 +2699,9 @@ mod tests {
     fn test_launch_order() {
         let order = |lines: &[&str]| -> Vec<String> {
             launch_order(lines.iter().map(|l| parse_exec_line(l).unwrap()).collect())
-                .into_iter().map(|e| e.command).collect()
+                .into_iter()
+                .map(|e| e.command)
+                .collect()
         };
         assert_eq!(
             order(&[
@@ -1693,17 +2725,21 @@ mod tests {
         ]);
         // A brave window titled "two" claims the "two" client even though "one" is first
         let two = client("brave", "two", 9, false, (5, 0), (1, 1));
-        assert_eq!(placer.assign(&two).unwrap().workspace.id, 2);
+        assert_eq!(placer.assign(&two).unwrap().workspace.selector(), "2");
         // Re-presenting the same window claims nothing more
         assert!(placer.assign(&two).is_none());
         // A differently titled brave window takes the remaining one, in saved order
         let other = client("brave", "changed title", 9, false, (6, 0), (1, 1));
-        assert_eq!(placer.assign(&other).unwrap().workspace.id, 1);
+        assert_eq!(placer.assign(&other).unwrap().workspace.selector(), "1");
         // A third brave window has nothing left to claim
-        assert!(placer.assign(&client("brave", "x", 9, false, (7, 0), (1, 1))).is_none());
+        assert!(placer
+            .assign(&client("brave", "x", 9, false, (7, 0), (1, 1)))
+            .is_none());
         assert!(!placer.is_complete());
         assert_eq!(placer.unmatched().len(), 1);
-        assert!(placer.assign(&client("kitty", "whatever", 9, false, (8, 0), (1, 1))).is_some());
+        assert!(placer
+            .assign(&client("kitty", "whatever", 9, false, (8, 0), (1, 1)))
+            .is_some());
         assert!(placer.is_complete());
     }
 
@@ -1713,13 +2749,28 @@ mod tests {
             client("kitty", "zsh", 1, false, (0, 0), (1, 1)),
             client("kitty", "zsh", 2, false, (0, 0), (1, 1)),
         ]);
-        assert_eq!(placer.assign(&client("kitty", "zsh", 9, false, (1, 0), (1, 1))).unwrap().workspace.id, 1);
-        assert_eq!(placer.assign(&client("kitty", "zsh", 9, false, (2, 0), (1, 1))).unwrap().workspace.id, 2);
+        assert_eq!(
+            placer
+                .assign(&client("kitty", "zsh", 9, false, (1, 0), (1, 1)))
+                .unwrap()
+                .workspace
+                .selector(),
+            "1"
+        );
+        assert_eq!(
+            placer
+                .assign(&client("kitty", "zsh", 9, false, (2, 0), (1, 1)))
+                .unwrap()
+                .workspace
+                .selector(),
+            "2"
+        );
     }
 
     /// A compositor whose launches make scripted windows appear after a delay in ticks
     struct FakeHost {
         tick: Cell<u64>,
+        merge: bool,
         windows: RefCell<Vec<(u64, Client)>>,
         scripts: RefCell<std::collections::VecDeque<Vec<(u64, Client)>>>,
         sent: RefCell<Vec<Op>>,
@@ -1737,19 +2788,26 @@ mod tests {
         warp: Cell<bool>,
         /// A dwindle layout simulation: moving a window onto a workspace splits the leaf nearest the pointer
         sim: Cell<bool>,
+        /// A destination workspace carries its previous maximized state into arrivals.
+        inherit_maximized: Cell<bool>,
+        /// Geometry acknowledgements delivered after placement.
+        geometry_updates: RefCell<Vec<(u64, Client)>>,
+        title_updates: RefCell<Vec<(u64, Address, String)>>,
+        tray_window: RefCell<Option<Client>>,
         /// Process info per window pid, for launch provenance
         procs: RefCell<std::collections::HashMap<i32, ProcessInfo>>,
         /// The workspace visible when the load starts
         start: Cell<i32>,
         /// Where the pointer was before the load touched anything (default: wherever it is)
         origin: Cell<Option<(i32, i32)>>,
-        leaves: RefCell<std::collections::HashMap<i32, Vec<(Address, crate::dwindle::Rect)>>>,
+        leaves: RefCell<std::collections::HashMap<String, Vec<(Address, crate::dwindle::Rect)>>>,
     }
 
     impl FakeHost {
         fn new(existing: Vec<Client>, scripts: Vec<Vec<(u64, Client)>>) -> Self {
             FakeHost {
                 tick: Cell::new(0),
+                merge: false,
                 windows: RefCell::new(existing.into_iter().map(|c| (0, c)).collect()),
                 scripts: RefCell::new(scripts.into()),
                 sent: RefCell::new(vec![]),
@@ -1762,6 +2820,10 @@ mod tests {
                 hide: RefCell::new(None),
                 warp: Cell::new(true),
                 sim: Cell::new(false),
+                inherit_maximized: Cell::new(false),
+                geometry_updates: RefCell::new(vec![]),
+                title_updates: RefCell::new(vec![]),
+                tray_window: RefCell::new(None),
                 procs: RefCell::new(Default::default()),
                 start: Cell::new(1),
                 origin: Cell::new(None),
@@ -1778,19 +2840,27 @@ mod tests {
                     tree.remove(at);
                 }
             }
-            for (_, c) in self.windows.borrow_mut().iter_mut().filter(|(_, c)| c.address == *window) {
-                c.workspace.id = -98;
-                c.workspace.name = "special:hyprsession-stage".to_string();
+            for (_, c) in self
+                .windows
+                .borrow_mut()
+                .iter_mut()
+                .filter(|(_, c)| c.address == *window)
+            {
+                c.workspace = Workspace::from_selector("special:hyprsession-stage");
             }
         }
 
         /// Dwindle as measured in spike #2: the new window splits the leaf nearest the pointer
         /// (ties: the oldest) along its longer side and becomes the second child
-        fn sim_insert(&self, window: &Address, ws: i32) {
+        fn sim_insert(&self, window: &Address, ws: &str) {
             const SCREEN: crate::dwindle::Rect = (0.0, 26.0, 1920.0, 1080.0);
-            let (px, py) = self.cursor.get().map(|(x, y)| (x as f64, y as f64)).unwrap_or((0.0, 0.0));
+            let (px, py) = self
+                .cursor
+                .get()
+                .map(|(x, y)| (x as f64, y as f64))
+                .unwrap_or((0.0, 0.0));
             let mut leaves = self.leaves.borrow_mut();
-            let tree = leaves.entry(ws).or_default();
+            let tree = leaves.entry(ws.to_owned()).or_default();
             if tree.is_empty() {
                 tree.push((window.clone(), SCREEN));
             } else {
@@ -1808,35 +2878,64 @@ mod tests {
             // every window of the workspace takes the geometry of its leaf (12 px at the screen edge, 7 between)
             let inset = |edge: f64, at: f64| if (edge - at).abs() < 0.5 { 12.0 } else { 7.0 };
             for (address, b) in tree.iter() {
-                let (x0, y0, x1, y1) = (b.0 + inset(b.0, SCREEN.0), b.1 + inset(b.1, SCREEN.1), b.2 - inset(b.2, SCREEN.2), b.3 - inset(b.3, SCREEN.3));
-                for (_, c) in self.windows.borrow_mut().iter_mut().filter(|(_, c)| c.address == *address) {
-                    c.workspace.id = ws;
-                    c.workspace.name = ws.to_string();
-                    c.at = (x0 as i16, y0 as i16);
-                    c.size = ((x1 - x0) as i16, (y1 - y0) as i16);
+                let (x0, y0, x1, y1) = (
+                    b.0 + inset(b.0, SCREEN.0),
+                    b.1 + inset(b.1, SCREEN.1),
+                    b.2 - inset(b.2, SCREEN.2),
+                    b.3 - inset(b.3, SCREEN.3),
+                );
+                for (_, c) in self
+                    .windows
+                    .borrow_mut()
+                    .iter_mut()
+                    .filter(|(_, c)| c.address == *address)
+                {
+                    c.workspace = Workspace::from_selector(ws);
+                    c.at = (x0 as i32, y0 as i32);
+                    c.size = ((x1 - x0) as i32, (y1 - y0) as i32);
                 }
             }
         }
 
         /// A compositor in the configuration the computed order is defined for, pointer bottom-left
         fn dwindle(self) -> Self {
-            self.options.borrow_mut().insert("general:layout".into(), "dwindle".into());
-            self.options.borrow_mut().insert("dwindle:force_split".into(), "2".into());
+            self.options
+                .borrow_mut()
+                .insert("general:layout".into(), "dwindle".into());
+            self.options
+                .borrow_mut()
+                .insert("dwindle:force_split".into(), "2".into());
             self.cursor.set(Some((300, 900)));
             self
         }
     }
 
     impl Host for FakeHost {
+        fn merge_existing(&self) -> bool {
+            self.merge
+        }
         fn clients(&self) -> hyprland::Result<Vec<Client>> {
-            let hidden = self.hide.borrow().as_ref().filter(|(n, _)| {
-                self.sent.borrow().iter().filter(|o| matches!(o, Op::Exec(_))).count() >= *n
-            }).map(|(_, a)| a.clone());
+            let hidden = self
+                .hide
+                .borrow()
+                .as_ref()
+                .filter(|(n, _)| {
+                    self.sent
+                        .borrow()
+                        .iter()
+                        .filter(|o| matches!(o, Op::Exec(_)))
+                        .count()
+                        >= *n
+                })
+                .map(|(_, a)| a.clone());
             Ok(self
                 .windows
                 .borrow()
                 .iter()
-                .filter(|(due, c)| *due <= self.tick.get() && hidden.as_deref() != Some(c.address.to_string().as_str()))
+                .filter(|(due, c)| {
+                    *due <= self.tick.get()
+                        && hidden.as_deref() != Some(c.address.to_string().as_str())
+                })
                 .map(|(_, c)| c.clone())
                 .collect())
         }
@@ -1854,8 +2953,51 @@ mod tests {
             }
             if let (Op::MoveToWorkspace { window, workspace }, true) = (op, self.sim.get()) {
                 match workspace {
-                    crate::dispatch::WorkspaceTarget::Id(ws) => self.sim_insert(window, *ws),
+                    crate::dispatch::WorkspaceTarget::Id(ws) => {
+                        self.sim_insert(window, &ws.to_string())
+                    }
                     crate::dispatch::WorkspaceTarget::Special(_) => self.sim_park(window),
+                    crate::dispatch::WorkspaceTarget::Named(name) => self.sim_insert(window, name),
+                }
+            }
+            if let (Op::MoveToWorkspace { window, workspace }, false) = (op, self.sim.get()) {
+                let selector = match workspace {
+                    crate::dispatch::WorkspaceTarget::Id(id) => id.to_string(),
+                    crate::dispatch::WorkspaceTarget::Named(name) => format!("name:{name}"),
+                    crate::dispatch::WorkspaceTarget::Special(name) => format!("special:{name}"),
+                };
+                for (_, client) in self
+                    .windows
+                    .borrow_mut()
+                    .iter_mut()
+                    .filter(|(_, c)| c.address == *window)
+                {
+                    client.workspace = Workspace::from_selector(&selector);
+                    if self.inherit_maximized.get() && !selector.starts_with("special:") {
+                        client.fullscreen = FullscreenMode::Maximized;
+                    }
+                }
+            }
+            if let Op::Fullscreen {
+                window,
+                maximized,
+                enable,
+            } = op
+            {
+                for (_, client) in self
+                    .windows
+                    .borrow_mut()
+                    .iter_mut()
+                    .filter(|(_, c)| c.address == *window)
+                {
+                    let mask = if *maximized { 1 } else { 2 };
+                    let bits = client.fullscreen as i32;
+                    client.fullscreen = match if *enable { bits | mask } else { bits & !mask } {
+                        1 => FullscreenMode::Maximized,
+                        2 => FullscreenMode::Fullscreen,
+                        3 => FullscreenMode::MaximizedFullscreen,
+                        _ => FullscreenMode::None,
+                    };
                 }
             }
             if let (Op::MoveCursor { x, y }, true) = (op, self.warp.get()) {
@@ -1867,29 +3009,90 @@ mod tests {
             self.sent.borrow_mut().push(op.clone());
             Ok(())
         }
-        fn cursor_pos(&self) -> Option<(i32, i32)> { self.cursor.get() }
-        fn option(&self, key: &str) -> Option<String> { self.options.borrow().get(key).cloned() }
+        fn cursor_pos(&self) -> Option<(i32, i32)> {
+            self.cursor.get()
+        }
+        fn option(&self, key: &str) -> Option<String> {
+            self.options.borrow().get(key).cloned()
+        }
         fn signal(&self, pid: i32, signal: Signal) {
             self.signals.borrow_mut().push((pid, signal));
-            let needed = match signal { Signal::Term => 1, Signal::Kill => 2 };
+            let needed = match signal {
+                Signal::Term => 1,
+                Signal::Kill => 2,
+            };
             let resist = self.resist.borrow().get(&pid).copied().unwrap_or(0);
             if resist <= needed {
                 self.windows.borrow_mut().retain(|(_, c)| c.pid != pid);
             }
         }
-        fn active_workspace(&self) -> Option<i32> { Some(self.start.get()) }
-        fn process(&self, pid: i32) -> Option<ProcessInfo> { self.procs.borrow().get(&pid).cloned() }
-        fn pointer_origin(&self) -> Option<(i32, i32)> { self.origin.get().or(self.cursor.get()) }
+        fn active_workspace(&self) -> Option<String> {
+            Some(self.start.get().to_string())
+        }
+        fn process(&self, pid: i32) -> Option<ProcessInfo> {
+            self.procs.borrow().get(&pid).cloned()
+        }
+        fn reveal_tray_window(&self, _entry: &ExecEntry) -> bool {
+            if let Some(window) = self.tray_window.borrow_mut().take() {
+                self.windows.borrow_mut().push((self.tick.get(), window));
+                true
+            } else {
+                false
+            }
+        }
+        fn pointer_origin(&self) -> Option<(i32, i32)> {
+            self.origin.get().or(self.cursor.get())
+        }
         fn pause(&self) {
             self.tick.set(self.tick.get() + 1);
             self.pauses.set(self.pauses.get() + 1);
+            self.title_updates
+                .borrow_mut()
+                .retain(|(due, address, title)| {
+                    if *due > self.tick.get() {
+                        return true;
+                    }
+                    for (_, live) in self
+                        .windows
+                        .borrow_mut()
+                        .iter_mut()
+                        .filter(|(_, c)| c.address == *address)
+                    {
+                        live.title = title.clone();
+                    }
+                    false
+                });
+            self.geometry_updates.borrow_mut().retain(|(due, saved)| {
+                if *due > self.tick.get() {
+                    return true;
+                }
+                for (_, live) in self
+                    .windows
+                    .borrow_mut()
+                    .iter_mut()
+                    .filter(|(_, c)| c.address == saved.address)
+                {
+                    live.at = saved.at;
+                    live.size = saved.size;
+                }
+                false
+            });
         }
     }
 
-    fn entry(line: &str) -> ExecEntry { parse_exec_line(line).unwrap() }
+    fn entry(line: &str) -> ExecEntry {
+        parse_exec_line(line).unwrap()
+    }
 
     fn execs(host: &FakeHost) -> Vec<String> {
-        host.sent.borrow().iter().filter_map(|o| match o { Op::Exec(c) => Some(c.clone()), _ => None }).collect()
+        host.sent
+            .borrow()
+            .iter()
+            .filter_map(|o| match o {
+                Op::Exec(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -1906,20 +3109,33 @@ mod tests {
             place_by_class: false,
             tail_ticks: 0,
             scope: None,
-            restore_workspace: Some(7),
+            restore_workspace: Some("7".into()),
         };
         let report = run_load(&host, &plan);
         assert_eq!(report.placed, 2);
         // Workspace 2 launches before workspace 4
         assert_eq!(execs(&host), vec!["kitty", "mpv"]);
         let sent = host.sent.borrow();
-        assert!(sent.contains(&Op::MoveToWorkspace { window: a.address.clone(), workspace: crate::dispatch::WorkspaceTarget::Id(2) }));
-        assert!(sent.contains(&Op::MoveWindow { window: b.address.clone(), x: 100, y: 200 }));
-        assert!(sent.contains(&Op::ResizeWindow { window: b.address.clone(), w: 300, h: 400 }));
+        assert!(sent.contains(&Op::MoveToWorkspace {
+            window: a.address.clone(),
+            workspace: crate::dispatch::WorkspaceTarget::Id(2)
+        }));
+        assert!(sent.contains(&Op::MoveWindow {
+            window: b.address.clone(),
+            x: 100,
+            y: 200
+        }));
+        assert!(sent.contains(&Op::ResizeWindow {
+            window: b.address.clone(),
+            w: 300,
+            h: 400
+        }));
         // The tiled window gets its workspace only
-        assert!(!sent.iter().any(|o| matches!(o, Op::MoveWindow { window, .. } if *window == a.address)));
+        assert!(!sent
+            .iter()
+            .any(|o| matches!(o, Op::MoveWindow { window, .. } if *window == a.address)));
         // Focus returns to the workspace that was active when load started
-        assert_eq!(sent.last(), Some(&Op::FocusWorkspace(7)));
+        assert_eq!(sent.last(), Some(&Op::FocusWorkspace("7".into())));
     }
 
     #[test]
@@ -1949,7 +3165,10 @@ mod tests {
 
     #[test]
     fn test_load_ends_early_once_everything_is_matched() {
-        let host = FakeHost::new(vec![], vec![vec![(1, client("kitty", "t", 9, false, (1, 0), (1, 1)))]]);
+        let host = FakeHost::new(
+            vec![],
+            vec![vec![(1, client("kitty", "t", 9, false, (1, 0), (1, 1)))]],
+        );
         let plan = LoadPlan {
             entries: vec![entry("[workspace 1 silent] kitty")],
             saved: vec![client("kitty", "t", 1, false, (0, 0), (1, 1))],
@@ -1967,27 +3186,45 @@ mod tests {
         ExecEntry {
             rules: ExecRules::default(),
             command: label.to_string(),
-            group: Some(GroupInfo { label: label.to_string(), saved }),
+            group: Some(GroupInfo {
+                label: label.to_string(),
+                saved,
+            }),
         }
     }
 
-    fn brave_saved(n: i16) -> Vec<Client> {
-        (0..n).map(|i| client("brave", &format!("w{i}"), 1 + i as i32, false, (i, 0), (1, 1))).collect()
+    fn brave_saved(n: i32) -> Vec<Client> {
+        (0..n)
+            .map(|i| client("brave", &format!("w{i}"), 1 + i, false, (i, 0), (1, 1)))
+            .collect()
     }
 
-    fn live_brave(i: i16) -> Client {
+    fn live_brave(i: i32) -> Client {
         client("brave", &format!("live{i}"), 9, false, (50 + i, 0), (1, 1))
     }
 
     fn group_plan(entries: Vec<ExecEntry>, saved: Vec<Client>) -> LoadPlan {
-        LoadPlan { entries, saved, place_by_class: true, tail_ticks: 0, scope: None, restore_workspace: None }
+        LoadPlan {
+            entries,
+            saved,
+            place_by_class: true,
+            tail_ticks: 0,
+            scope: None,
+            restore_workspace: None,
+        }
     }
 
     #[test]
     fn test_group_with_a_missing_window_is_launched_again_and_both_are_placed() {
         // Two same-profile windows saved; the first launch brings up one, the second one more
-        let host = FakeHost::new(vec![], vec![vec![(1, live_brave(0))], vec![(1, live_brave(1))]]);
-        let plan = group_plan(vec![group_entry("brave --profile x", vec![0, 1])], brave_saved(2));
+        let host = FakeHost::new(
+            vec![],
+            vec![vec![(1, live_brave(0))], vec![(1, live_brave(1))]],
+        );
+        let plan = group_plan(
+            vec![group_entry("brave --profile x", vec![0, 1])],
+            brave_saved(2),
+        );
         let report = run_load(&host, &plan);
         assert_eq!(execs(&host), vec!["brave --profile x", "brave --profile x"]);
         assert_eq!(report.placed, 2);
@@ -2006,9 +3243,15 @@ mod tests {
         let host = FakeHost::new(vec![], vec![vec![(1, live_brave(0))], vec![]]);
         let plan = group_plan(vec![group_entry("brave", vec![0, 1])], brave_saved(2));
         let report = run_load(&host, &plan);
-        assert_eq!(report.shortfalls, vec![GroupShortfall {
-            label: "brave".to_string(), expected: 2, got: 1, reinvocations: 1,
-        }]);
+        assert_eq!(
+            report.shortfalls,
+            vec![GroupShortfall {
+                label: "brave".to_string(),
+                expected: 2,
+                got: 1,
+                reinvocations: 1,
+            }]
+        );
         assert_eq!(execs(&host).len(), 2);
     }
 
@@ -2029,7 +3272,11 @@ mod tests {
         let report = run_load(&host, &plan);
         assert_eq!(execs(&host).len(), 1);
         assert!(report.shortfalls.is_empty());
-        assert!(host.pauses.get() < SETTLE_TICKS, "waited {} ticks", host.pauses.get());
+        assert!(
+            host.pauses.get() < SETTLE_TICKS,
+            "waited {} ticks",
+            host.pauses.get()
+        );
     }
 
     #[test]
@@ -2060,12 +3307,18 @@ mod tests {
         ]);
         let groups: Vec<(&str, &[usize])> = entries
             .iter()
-            .map(|e| { let g = e.group.as_ref().unwrap(); (g.label.as_str(), g.saved.as_slice()) })
+            .map(|e| {
+                let g = e.group.as_ref().unwrap();
+                (g.label.as_str(), g.saved.as_slice())
+            })
             .collect();
-        assert_eq!(groups, vec![
-            ("brave --profile-directory=Default", &[0usize, 2][..]),
-            ("kitty", &[1usize][..]),
-        ]);
+        assert_eq!(
+            groups,
+            vec![
+                ("brave --profile-directory=Default", &[0usize, 2][..]),
+                ("kitty", &[1usize][..]),
+            ]
+        );
     }
 
     #[test]
@@ -2088,7 +3341,11 @@ mod tests {
         assert_eq!(report.surplus[0].address, stray.address);
         assert_eq!(report.surplus[0].class, "mpv");
         // Report only: nothing was dispatched for the stray window
-        assert!(!host.sent.borrow().iter().any(|op| format!("{op:?}").contains("0xabc")));
+        assert!(!host
+            .sent
+            .borrow()
+            .iter()
+            .any(|op| format!("{op:?}").contains("0xabc")));
     }
 
     #[test]
@@ -2110,7 +3367,10 @@ mod tests {
 
     #[test]
     fn test_legacy_plans_report_no_surplus() {
-        let host = FakeHost::new(vec![client("kitty", "t", 1, false, (0, 0), (1, 1))], vec![vec![]]);
+        let host = FakeHost::new(
+            vec![client("kitty", "t", 1, false, (0, 0), (1, 1))],
+            vec![vec![]],
+        );
         let plan = LoadPlan {
             entries: vec![entry("[workspace 1 silent] daemon")],
             saved: vec![],
@@ -2159,14 +3419,25 @@ mod tests {
         pids.iter()
             .enumerate()
             .map(|(i, (pid, class))| {
-                let mut c = client(class, &format!("{class} {i}"), 1, false, (i as i16, 0), (1, 1));
+                let mut c = client(
+                    class,
+                    &format!("{class} {i}"),
+                    1,
+                    false,
+                    (i as i32, 0),
+                    (1, 1),
+                );
                 c.pid = *pid;
                 c
             })
             .collect()
     }
 
-    const FAST: ClearConfig = ClearConfig { close_ticks: 3, term_ticks: 3, kill_ticks: 3 };
+    const FAST: ClearConfig = ClearConfig {
+        close_ticks: 3,
+        term_ticks: 3,
+        kill_ticks: 3,
+    };
 
     #[test]
     fn test_clear_on_empty_desktop_does_nothing() {
@@ -2178,19 +3449,35 @@ mod tests {
 
     #[test]
     fn test_clear_closes_gracefully_without_any_signal() {
-        let host = FakeHost::new(desktop(&[(10, "brave"), (20, "kitty"), (10, "brave")]), vec![]);
+        let host = FakeHost::new(
+            desktop(&[(10, "brave"), (20, "kitty"), (10, "brave")]),
+            vec![],
+        );
         let report = clear_session(&host, &FAST).unwrap();
         assert_eq!(report.closed.len(), 3);
         assert!(report.termed.is_empty() && report.killed.is_empty());
         assert!(host.signals.borrow().is_empty());
-        let closes = host.sent.borrow().iter().filter(|o| matches!(o, Op::Close(_))).count();
+        let closes = host
+            .sent
+            .borrow()
+            .iter()
+            .filter(|o| matches!(o, Op::Close(_)))
+            .count();
         assert_eq!(closes, 3);
     }
 
     #[test]
     fn test_clear_escalates_only_for_what_stays() {
         // kitty closes; spotify ignores close but not SIGTERM; stubborn needs SIGKILL
-        let host = FakeHost::new(desktop(&[(20, "kitty"), (30, "spotify"), (30, "spotify"), (40, "stubborn")]), vec![]);
+        let host = FakeHost::new(
+            desktop(&[
+                (20, "kitty"),
+                (30, "spotify"),
+                (30, "spotify"),
+                (40, "stubborn"),
+            ]),
+            vec![],
+        );
         host.resist.borrow_mut().insert(30, 1);
         host.resist.borrow_mut().insert(40, 2);
         let report = clear_session(&host, &FAST).unwrap();
@@ -2214,7 +3501,10 @@ mod tests {
         clear_session(&host, &FAST).unwrap();
         // The close request went out before any signal
         assert!(matches!(host.sent.borrow().first(), Some(Op::Close(_))));
-        assert_eq!(*host.signals.borrow(), vec![(50, Signal::Term), (50, Signal::Kill)]);
+        assert_eq!(
+            *host.signals.borrow(),
+            vec![(50, Signal::Term), (50, Signal::Kill)]
+        );
     }
 
     #[test]
@@ -2237,7 +3527,7 @@ mod tests {
     }
 
     /// A window of `class` owned by `pid` on workspace `ws`; `n` keeps addresses distinct
-    fn win(class: &str, pid: i32, ws: i32, n: i16) -> Client {
+    fn win(class: &str, pid: i32, ws: i32, n: i32) -> Client {
         let mut c = client(class, &format!("{class} {n}"), ws, false, (n, 0), (1, 1));
         c.pid = pid;
         c.address = hyprland::shared::Address::new(format!("0x{:x}{:02x}", ws, n));
@@ -2245,7 +3535,12 @@ mod tests {
     }
 
     fn addresses(host: &FakeHost) -> Vec<String> {
-        let mut a: Vec<String> = host.windows.borrow().iter().map(|(_, c)| c.address.to_string()).collect();
+        let mut a: Vec<String> = host
+            .windows
+            .borrow()
+            .iter()
+            .map(|(_, c)| c.address.to_string())
+            .collect();
         a.sort();
         a
     }
@@ -2253,15 +3548,29 @@ mod tests {
     #[test]
     fn test_scoped_clear_leaves_other_workspaces_alone() {
         let host = FakeHost::new(
-            vec![win("kitty", 10, 1, 1), win("brave", 20, 1, 2), win("mpv", 30, 2, 3), win("foot", 40, 2, 4)],
+            vec![
+                win("kitty", 10, 1, 1),
+                win("brave", 20, 1, 2),
+                win("mpv", 30, 2, 3),
+                win("foot", 40, 2, 4),
+            ],
             vec![],
         );
-        let report = clear_windows(&host, &FAST, Scope::Workspace(1)).unwrap();
+        let report = clear_windows(&host, &FAST, Scope::Workspace("1".into())).unwrap();
         assert_eq!(report.closed.len(), 2);
         // Only workspace 1 was asked to close; workspace 2's addresses are untouched
-        let closes: Vec<_> = host.sent.borrow().iter().filter(|o| matches!(o, Op::Close(_))).cloned().collect();
+        let closes: Vec<_> = host
+            .sent
+            .borrow()
+            .iter()
+            .filter(|o| matches!(o, Op::Close(_)))
+            .cloned()
+            .collect();
         assert_eq!(closes.len(), 2);
-        assert_eq!(addresses(&host), vec!["0x203".to_string(), "0x204".to_string()]);
+        assert_eq!(
+            addresses(&host),
+            vec!["0x203".to_string(), "0x204".to_string()]
+        );
         assert!(host.signals.borrow().is_empty());
     }
 
@@ -2269,45 +3578,68 @@ mod tests {
     fn test_scoped_clear_never_signals_a_pid_shared_with_another_workspace() {
         // pid 50 owns a window on workspace 1 and one on workspace 2; it ignores close and TERM
         let host = FakeHost::new(
-            vec![win("brave", 50, 1, 1), win("brave", 50, 2, 2), win("kitty", 60, 1, 3)],
+            vec![
+                win("brave", 50, 1, 1),
+                win("brave", 50, 2, 2),
+                win("kitty", 60, 1, 3),
+            ],
             vec![],
         );
         host.resist.borrow_mut().insert(50, 2);
-        let report = clear_windows(&host, &FAST, Scope::Workspace(1)).unwrap();
+        let report = clear_windows(&host, &FAST, Scope::Workspace("1".into())).unwrap();
         // The refusing window is reported, no signal ever reached pid 50, both its windows survive
         assert_eq!(report.refused.len(), 1);
         assert!(report.refused[0].contains("pid 50"), "{:?}", report.refused);
         assert!(host.signals.borrow().iter().all(|(pid, _)| *pid != 50));
-        assert_eq!(addresses(&host), vec!["0x101".to_string(), "0x202".to_string()]);
+        assert_eq!(
+            addresses(&host),
+            vec!["0x101".to_string(), "0x202".to_string()]
+        );
     }
 
     #[test]
     fn test_scoped_clear_still_escalates_for_pids_wholly_in_scope() {
         let host = FakeHost::new(
-            vec![win("spotify", 70, 1, 1), win("spotify", 70, 1, 2), win("other", 80, 2, 3), win("shared", 90, 1, 4), win("shared", 90, 2, 5)],
+            vec![
+                win("spotify", 70, 1, 1),
+                win("spotify", 70, 1, 2),
+                win("other", 80, 2, 3),
+                win("shared", 90, 1, 4),
+                win("shared", 90, 2, 5),
+            ],
             vec![],
         );
         host.resist.borrow_mut().insert(70, 1);
         host.resist.borrow_mut().insert(90, 3);
-        let report = clear_windows(&host, &FAST, Scope::Workspace(1)).unwrap();
+        let report = clear_windows(&host, &FAST, Scope::Workspace("1".into())).unwrap();
         assert_eq!(*host.signals.borrow(), vec![(70, Signal::Term)]);
         assert_eq!(report.termed, vec![70]);
         assert_eq!(report.refused.len(), 1);
-        assert_eq!(addresses(&host), vec!["0x104".to_string(), "0x203".to_string(), "0x205".to_string()]);
+        assert_eq!(
+            addresses(&host),
+            vec![
+                "0x104".to_string(),
+                "0x203".to_string(),
+                "0x205".to_string()
+            ]
+        );
     }
 
     #[test]
     fn test_scoped_clear_aborts_when_an_in_scope_pid_survives_sigkill() {
-        let host = FakeHost::new(vec![win("zombie", 60, 1, 1), win("kitty", 70, 2, 2)], vec![]);
+        let host = FakeHost::new(
+            vec![win("zombie", 60, 1, 1), win("kitty", 70, 2, 2)],
+            vec![],
+        );
         host.resist.borrow_mut().insert(60, 3);
-        let err = clear_windows(&host, &FAST, Scope::Workspace(1)).unwrap_err();
+        let err = clear_windows(&host, &FAST, Scope::Workspace("1".into())).unwrap_err();
         assert!(err.contains("pid 60") && !err.contains("kitty"), "{err}");
     }
 
     #[test]
     fn test_scoped_clear_of_an_empty_workspace_does_nothing() {
         let host = FakeHost::new(vec![win("kitty", 10, 2, 1)], vec![]);
-        clear_windows(&host, &FAST, Scope::Workspace(1)).unwrap();
+        clear_windows(&host, &FAST, Scope::Workspace("1".into())).unwrap();
         assert!(host.sent.borrow().is_empty());
     }
 
@@ -2323,29 +3655,41 @@ mod tests {
             saved: vec![client("brave", "w", 1, false, (0, 0), (1, 1))],
             place_by_class: true,
             tail_ticks: 3,
-            scope: Some(1),
-            restore_workspace: Some(2),
+            scope: Some("1".into()),
+            restore_workspace: Some("2".into()),
         };
         let report = run_load(&host, &plan);
         assert_eq!(report.placed, 1);
         let sent = host.sent.borrow();
-        let touches = |a: &hyprland::shared::Address| sent.iter().any(|o| format!("{o:?}").contains(&a.to_string()));
+        let touches = |a: &hyprland::shared::Address| {
+            sent.iter()
+                .any(|o| format!("{o:?}").contains(&a.to_string()))
+        };
         assert!(!touches(&other.address), "{sent:?}");
         // The only focus change is the v1 return-to-start
-        let focuses: Vec<_> = sent.iter().filter(|o| matches!(o, Op::FocusWorkspace(_) | Op::FocusWindow(_))).collect();
-        assert_eq!(focuses, vec![&Op::FocusWorkspace(2)]);
+        let focuses: Vec<_> = sent
+            .iter()
+            .filter(|o| matches!(o, Op::FocusWorkspace(_) | Op::FocusWindow(_)))
+            .collect();
+        assert_eq!(focuses, vec![&Op::FocusWorkspace("2".into())]);
         // And it is not reported as surplus either
         assert!(report.surplus.is_empty());
     }
 
     #[test]
     fn test_placer_reports_the_claimed_index_and_gives_claims_back() {
-        let saves = vec![client("kitty", "a", 1, false, (0, 0), (1, 1)), client("kitty", "b", 1, false, (0, 0), (1, 1))];
+        let saves = vec![
+            client("kitty", "a", 1, false, (0, 0), (1, 1)),
+            client("kitty", "b", 1, false, (0, 0), (1, 1)),
+        ];
         let mut placer = Placer::new(saves);
         let live = client("kitty", "b", 9, false, (1, 0), (1, 1));
         let (index, claimed) = placer.assign_indexed(&live).unwrap();
         assert_eq!((index, claimed.title.as_str()), (1, "b"));
-        assert!(placer.assign_indexed(&live).is_none(), "one live window claims once");
+        assert!(
+            placer.assign_indexed(&live).is_none(),
+            "one live window claims once"
+        );
         placer.release(index);
         assert_eq!(placer.unmatched().len(), 2);
         assert_eq!(placer.assign_indexed(&live).unwrap().0, 1);
@@ -2354,7 +3698,7 @@ mod tests {
     // ---- placement queue: tiled windows are placed per workspace, in computed insertion order
 
     /// One tiled save per class on `ws`, at the given rectangles (x, y, w, h)
-    fn tiled_saves(ws: i32, shape: &[(i16, i16, i16, i16)]) -> Vec<Client> {
+    fn tiled_saves(ws: i32, shape: &[(i32, i32, i32, i32)]) -> Vec<Client> {
         shape
             .iter()
             .enumerate()
@@ -2364,100 +3708,44 @@ mod tests {
 
     /// Spike #1 fixture "A" (insertion order = index order at a bottom-left pointer) and a
     /// reading order that differs from it: index 1 is the full-height window on the right
-    const S4: [(i16, i16, i16, i16); 4] = [(12, 38, 941, 508), (967, 38, 941, 1030), (12, 560, 466, 508), (492, 560, 461, 508)];
+    const S4: [(i32, i32, i32, i32); 4] = [
+        (12, 38, 941, 508),
+        (967, 38, 941, 1030),
+        (12, 560, 466, 508),
+        (492, 560, 461, 508),
+    ];
 
-    fn live_window(class: &str, n: i16) -> Client {
+    fn live_window(class: &str, n: i32) -> Client {
         let mut c = client(class, "t", 9, false, (50 + n, 0), (1, 1));
         c.address = hyprland::shared::Address::new(format!("0xa{n:02x}"));
         c
     }
 
     /// Entries launching `launch_order` (indices into the saves), each bringing up its own window
-    fn launching(saves: &[Client], launch_order: &[usize]) -> (Vec<ExecEntry>, Vec<Vec<(u64, Client)>>) {
-        let entries = launch_order.iter().map(|&i| group_entry(&format!("app{i}"), vec![i])).collect();
-        let scripts = launch_order.iter().map(|&i| vec![(1, live_window(&saves[i].class, i as i16))]).collect();
+    fn launching(
+        saves: &[Client],
+        launch_order: &[usize],
+    ) -> (Vec<ExecEntry>, Vec<Vec<(u64, Client)>>) {
+        let entries = launch_order
+            .iter()
+            .map(|&i| group_entry(&format!("app{i}"), vec![i]))
+            .collect();
+        let scripts = launch_order
+            .iter()
+            .map(|&i| vec![(1, live_window(&saves[i].class, i as i32))])
+            .collect();
         (entries, scripts)
     }
 
-    /// The addresses of the windows moved to a workspace, in the order the moves were sent
-    fn moved(host: &FakeHost) -> Vec<String> {
-        host.sent
-            .borrow()
-            .iter()
-            .filter_map(|o| match o {
-                Op::MoveToWorkspace { window, .. } => Some(window.to_string()),
-                _ => None,
-            })
-            .collect()
-    }
-
     fn plan_for(entries: Vec<ExecEntry>, saved: Vec<Client>) -> LoadPlan {
-        LoadPlan { entries, saved, place_by_class: true, tail_ticks: 0, scope: None, restore_workspace: None }
-    }
-
-    #[test]
-    fn test_tiled_moves_follow_the_computed_order_whatever_the_arrival_order() {
-        let saves = tiled_saves(2, &S4);
-        let expected: Vec<String> = (0..4).map(|i| format!("0xa{i:02x}")).collect();
-        for arrival in [[0, 1, 2, 3], [3, 2, 1, 0], [2, 0, 3, 1]] {
-            let (entries, scripts) = launching(&saves, &arrival);
-            let host = FakeHost::new(vec![], scripts).dwindle();
-            let report = run_load(&host, &plan_for(entries, saves.clone()));
-            assert_eq!(moved(&host), expected, "arrival {arrival:?}");
-            assert_eq!(report.placed, 4);
-            assert_eq!((report.flushes[0].steered, report.flushes[0].fallback.clone(), report.flushes[0].pointer_moved), (true, None, false));
+        LoadPlan {
+            entries,
+            saved,
+            place_by_class: true,
+            tail_ticks: 0,
+            scope: None,
+            restore_workspace: None,
         }
-    }
-
-    #[test]
-    fn test_unreachable_tree_falls_back_to_reading_order_and_says_why() {
-        // the same fixture with the pointer on the right: not the tree dwindle grows there
-        let saves = tiled_saves(2, &S4);
-        let (entries, scripts) = launching(&saves, &[0, 1, 2, 3]);
-        let host = FakeHost::new(vec![], scripts).dwindle();
-        host.warp.set(false);
-        host.cursor.set(Some((1500, 200)));
-        let report = run_load(&host, &plan_for(entries, saves));
-        // reading order: x, then y -> indices 0, 2, 3, 1
-        assert_eq!(moved(&host), vec!["0xa00", "0xa02", "0xa03", "0xa01"]);
-        assert!(report.flushes[0].fallback.as_deref().unwrap().contains("not one dwindle grows"));
-    }
-
-    #[test]
-    fn test_other_layouts_and_unreadable_options_fall_back_to_reading_order() {
-        let saves = tiled_saves(2, &S4);
-        for (key, value) in [("general:layout", "master"), ("dwindle:force_split", "0")] {
-            let (entries, scripts) = launching(&saves, &[0, 1, 2, 3]);
-            let host = FakeHost::new(vec![], scripts).dwindle();
-            host.warp.set(false);
-            host.options.borrow_mut().insert(key.into(), value.into());
-            let report = run_load(&host, &plan_for(entries, saves.clone()));
-            assert_eq!(moved(&host), vec!["0xa00", "0xa02", "0xa03", "0xa01"], "{key}={value}");
-            assert!(report.flushes[0].fallback.is_some());
-        }
-        // a host that can tell nothing (no options, no pointer)
-        let (entries, scripts) = launching(&saves, &[0, 1, 2, 3]);
-        let host = FakeHost::new(vec![], scripts);
-        let report = run_load(&host, &plan_for(entries, saves));
-        assert!(report.flushes[0].fallback.as_deref().unwrap().contains("unknown"));
-        assert_eq!(report.placed, 4);
-    }
-
-    #[test]
-    fn test_nothing_is_moved_until_the_workspace_is_ready() {
-        // Two apps for ws 2, then one for ws 3: ws 2's moves come after its second Exec and
-        // before ws 3's launch
-        let mut saves = tiled_saves(2, &S4[..2]);
-        saves.push(client("app2", "t", 3, false, (12, 38), (1896, 1030)));
-        let (entries, scripts) = launching(&saves, &[0, 1, 2]);
-        let host = FakeHost::new(vec![], scripts).dwindle();
-        run_load(&host, &plan_for(entries, saves));
-        let sent = host.sent.borrow();
-        let pos = |f: &dyn Fn(&Op) -> bool| sent.iter().position(|o| f(o)).unwrap();
-        let first_move = pos(&|o| matches!(o, Op::MoveToWorkspace { .. }));
-        let exec = |n: usize| sent.iter().enumerate().filter(|(_, o)| matches!(o, Op::Exec(_))).nth(n).unwrap().0;
-        assert!(exec(0) < exec(1) && exec(1) < first_move, "{sent:?}");
-        assert!(first_move < exec(2), "ws 2 flushes before ws 3 launches: {sent:?}");
     }
 
     #[test]
@@ -2468,7 +3756,6 @@ mod tests {
         scripts[2] = vec![];
         let host = FakeHost::new(vec![], scripts).dwindle();
         let report = run_load(&host, &plan_for(entries, saves));
-        assert_eq!(moved(&host), vec!["0xa00", "0xa01"]);
         assert_eq!(report.placed, 2);
         assert_eq!(report.unmatched.len(), 1);
     }
@@ -2483,7 +3770,6 @@ mod tests {
         let mut plan = plan_for(entries, saves);
         plan.tail_ticks = 2 * LAUNCH_WAIT_TICKS;
         let report = run_load(&host, &plan);
-        assert_eq!(moved(&host), vec!["0xa00", "0xa01"]);
         assert_eq!(report.placed, 2);
         assert!(report.unmatched.is_empty());
         // two flushes never happen for one workspace: the late window was placed on claim
@@ -2491,26 +3777,38 @@ mod tests {
     }
 
     #[test]
-    fn test_floating_windows_are_placed_on_claim_with_exact_geometry() {
-        let mut saves = tiled_saves(2, &S4[..2]);
-        saves.push(client("app2", "t", 2, true, (100, 200), (300, 400)));
-        let (entries, scripts) = launching(&saves, &[0, 2, 1]);
-        let host = FakeHost::new(vec![], scripts).dwindle();
-        run_load(&host, &plan_for(entries, saves));
-        let sent = host.sent.borrow();
-        let float_move = sent.iter().position(|o| matches!(o, Op::MoveWindow { x: 100, y: 200, .. })).unwrap();
-        let second_exec = sent.iter().enumerate().filter(|(_, o)| matches!(o, Op::Exec(_))).nth(2).unwrap().0;
-        assert!(float_move < second_exec, "the float is placed before the next launch: {sent:?}");
-        assert!(sent.iter().any(|o| matches!(o, Op::ResizeWindow { w: 300, h: 400, .. })));
-        // tiled windows are never given geometry
-        assert_eq!(sent.iter().filter(|o| matches!(o, Op::MoveWindow { .. })).count(), 1);
+    fn restored_window_does_not_inherit_destination_maximization() {
+        let live = live_window("app", 1);
+        let mut saved = live.clone();
+        saved.workspace = Workspace::from_selector("7");
+        let host = FakeHost::new(vec![], vec![vec![(1, live)]]);
+        host.inherit_maximized.set(true);
+        let report = run_load(
+            &host,
+            &plan_for(vec![group_entry("app", vec![0])], vec![saved]),
+        );
+        assert!(!report.incomplete);
+        let clients = host.clients().unwrap();
+        assert_eq!(clients[0].workspace.selector(), "7");
+        assert_eq!(clients[0].fullscreen, FullscreenMode::None);
     }
 
     #[test]
     fn test_group_reinvocation_newcomers_join_the_same_ordered_flush() {
         // One app opens two windows, but the first launch brings up only one
-        let saves = tiled_saves(2, &S4[..2]).into_iter().map(|mut c| { c.class = "app".into(); c.title = "t".into(); c }).collect::<Vec<_>>();
-        let mk = |n: i16| { let mut c = live_window("app", n); c.title = "t".into(); c };
+        let saves = tiled_saves(2, &S4[..2])
+            .into_iter()
+            .map(|mut c| {
+                c.class = "app".into();
+                c.title = "t".into();
+                c
+            })
+            .collect::<Vec<_>>();
+        let mk = |n: i32| {
+            let mut c = live_window("app", n);
+            c.title = "t".into();
+            c
+        };
         let host = FakeHost::new(vec![], vec![vec![(1, mk(0))], vec![(1, mk(1))]]).dwindle();
         let plan = plan_for(vec![group_entry("app", vec![0, 1])], saves);
         let report = run_load(&host, &plan);
@@ -2518,31 +3816,6 @@ mod tests {
         assert_eq!(report.placed, 2);
         assert_eq!(report.flushes.len(), 1);
         assert_eq!(report.flushes[0].windows, 2);
-    }
-
-    #[test]
-    fn test_adjust_only_moves_existing_windows_in_the_computed_order() {
-        let saves = tiled_saves(2, &S4);
-        let live: Vec<Client> = (0..4).rev().map(|i| live_window(&saves[i].class, i as i16)).collect();
-        let host = FakeHost::new(live, vec![]).dwindle();
-        let mut plan = plan_for(vec![], saves);
-        plan.tail_ticks = 3;
-        run_load(&host, &plan);
-        assert_eq!(moved(&host), vec!["0xa00", "0xa01", "0xa02", "0xa03"]);
-    }
-
-    #[test]
-    fn test_scoped_load_queues_within_its_slice_only() {
-        let other = win("brave", 11, 5, 1);
-        let saves = tiled_saves(2, &S4[..3]);
-        let (entries, scripts) = launching(&saves, &[2, 1, 0]);
-        let host = FakeHost::new(vec![other.clone()], scripts).dwindle();
-        let mut plan = plan_for(entries, saves);
-        plan.scope = Some(2);
-        let report = run_load(&host, &plan);
-        assert_eq!(moved(&host), vec!["0xa00", "0xa01", "0xa02"]);
-        assert!(!host.sent.borrow().iter().any(|o| format!("{o:?}").contains(&other.address.to_string())));
-        assert!(report.surplus.is_empty());
     }
 
     #[test]
@@ -2557,8 +3830,6 @@ mod tests {
         let mut plan = plan_for(entries, saves);
         plan.tail_ticks = 10;
         let report = run_load(&host, &plan);
-        // the vanished window gets no op; the other two are placed in order, the replacement on claim
-        assert_eq!(moved(&host), vec!["0xa00", "0xa02", "0xa07"]);
         assert_eq!(report.placed, 3);
         assert!(report.unmatched.is_empty());
     }
@@ -2574,35 +3845,44 @@ mod tests {
     }
 
     #[test]
-    fn test_anonymous_special_and_legacy_loads_bypass_the_queue() {
-        // anonymous special: placed on claim (and skipped by plan_adjustment)
-        let saves = vec![client("app0", "t", -99, false, (12, 38), (1896, 1030))];
-        let (entries, scripts) = launching(&saves, &[0]);
-        let host = FakeHost::new(vec![], scripts).dwindle();
-        let report = run_load(&host, &plan_for(entries, saves));
-        assert_eq!(report.placed, 1);
-        assert!(report.flushes.is_empty());
-    }
-
-    #[test]
     fn test_nothing_claimed_stays_held_when_the_load_ends() {
         // a group-less entry is pending everywhere until it ends; the tail still flushes
         let saves = tiled_saves(2, &S4[..2]);
-        let host = FakeHost::new(vec![], vec![vec![(1, live_window("app0", 0)), (2, live_window("app1", 1))]]).dwindle();
-        let entry = ExecEntry { rules: ExecRules::default(), command: "x".into(), group: None };
+        let host = FakeHost::new(
+            vec![],
+            vec![vec![
+                (1, live_window("app0", 0)),
+                (2, live_window("app1", 1)),
+            ]],
+        )
+        .dwindle();
+        let entry = ExecEntry {
+            rules: ExecRules::default(),
+            command: "x".into(),
+            group: None,
+        };
         let mut plan = plan_for(vec![entry], saves);
         plan.tail_ticks = 5;
         let report = run_load(&host, &plan);
         assert_eq!(report.placed, 2);
-        assert_eq!(moved(&host).len(), 2);
     }
 
     // ---- claim binding: a resume window binds to the entry that spawned it
 
     /// Five saved terminals that all wear the generic title; the entries are resume launches
     fn identical_title_terminals(n: usize) -> (Vec<Client>, Vec<ExecEntry>) {
-        let saves: Vec<Client> =
-            (0..n).map(|i| client("foot", "mike@omarchy:~", 1 + i as i32, false, (12, 38), (1896, 1030))).collect();
+        let saves: Vec<Client> = (0..n)
+            .map(|i| {
+                client(
+                    "foot",
+                    "user@testhost:~",
+                    1 + i as i32,
+                    false,
+                    (12, 38),
+                    (1896, 1030),
+                )
+            })
+            .collect();
         let entries = (0..n)
             .map(|i| {
                 let mut e = group_entry(&format!("foot {i}"), vec![i]);
@@ -2613,8 +3893,8 @@ mod tests {
         (saves, entries)
     }
 
-    fn foot_window(n: i16) -> Client {
-        let mut c = client("foot", "mike@omarchy:~", 9, false, (50 + n, 0), (1, 1));
+    fn foot_window(n: i32) -> Client {
+        let mut c = client("foot", "user@testhost:~", 9, false, (50 + n, 0), (1, 1));
         c.address = hyprland::shared::Address::new(format!("0xf{n:02x}"));
         c
     }
@@ -2625,7 +3905,10 @@ mod tests {
             .borrow()
             .iter()
             .filter_map(|o| match o {
-                Op::MoveToWorkspace { window, workspace: crate::dispatch::WorkspaceTarget::Id(id) } => Some((window.to_string(), *id)),
+                Op::MoveToWorkspace {
+                    window,
+                    workspace: crate::dispatch::WorkspaceTarget::Id(id),
+                } => Some((window.to_string(), *id)),
                 _ => None,
             })
             .collect()
@@ -2652,35 +3935,62 @@ mod tests {
         // saved order: [resume terminal (ws 1), plain terminal (ws 2)], same title. The plain
         // terminal's entry is launched FIRST; by title alone it would take save 0 (the resume's).
         let saves = vec![
-            client("foot", "mike@omarchy:~", 1, false, (12, 38), (1896, 1030)),
-            client("foot", "mike@omarchy:~", 2, false, (12, 38), (1896, 1030)),
+            client("foot", "user@testhost:~", 1, false, (12, 38), (1896, 1030)),
+            client("foot", "user@testhost:~", 2, false, (12, 38), (1896, 1030)),
         ];
         let mut resume = group_entry("foot", vec![0]);
         resume.command = "foot sh -c script hyprsession-resume /p cmd".into();
         let plain = group_entry("foot", vec![1]);
-        let host = FakeHost::new(vec![], vec![vec![(1, foot_window(1))], vec![(1, foot_window(0))]]);
+        let host = FakeHost::new(
+            vec![],
+            vec![vec![(1, foot_window(1))], vec![(1, foot_window(0))]],
+        );
         run_load(&host, &plan_for(vec![plain, resume], saves));
         let mut got = moves_to(&host);
         got.sort();
         // plain entry's window (0xf01) -> ws 2; resume entry's window (0xf00) -> ws 1
-        assert_eq!(got, vec![("0xf00".to_string(), 1), ("0xf01".to_string(), 2)]);
+        assert_eq!(
+            got,
+            vec![("0xf00".to_string(), 1), ("0xf01".to_string(), 2)]
+        );
     }
 
     #[test]
     fn test_spawn_binding_holds_when_a_late_retitle_would_have_split_the_titles() {
         // the resume window retitles itself after the claim: the binding must not care
-        let mut saves = vec![client("foot", "✳ Sennheiser", 1, false, (12, 38), (1896, 1030))];
-        saves.push(client("foot", "mike@omarchy:~", 8, false, (12, 38), (1896, 1030)));
-        let mut sennheiser = group_entry("foot", vec![0]);
-        sennheiser.command = "foot sh -c script hyprsession-resume /home/mike 'claude --continue'".into();
+        let mut saves = vec![client(
+            "foot",
+            "✳ Example project",
+            1,
+            false,
+            (12, 38),
+            (1896, 1030),
+        )];
+        saves.push(client(
+            "foot",
+            "user@testhost:~",
+            8,
+            false,
+            (12, 38),
+            (1896, 1030),
+        ));
+        let mut project = group_entry("foot", vec![0]);
+        project.command =
+            "foot sh -c script hyprsession-resume /home/user 'claude --continue'".into();
         let mut other = group_entry("foot", vec![1]);
         other.command = "foot sh -c script hyprsession-resume /p cmd".into();
-        // the Sennheiser window is still generically titled when it maps
-        let host = FakeHost::new(vec![], vec![vec![(1, foot_window(0))], vec![(1, foot_window(1))]]);
-        run_load(&host, &plan_for(vec![sennheiser, other], saves));
+        // The project window is still generically titled when it maps.
+        let host = FakeHost::new(
+            vec![],
+            vec![vec![(1, foot_window(0))], vec![(1, foot_window(1))]],
+        );
+        run_load(&host, &plan_for(vec![project, other], saves));
         let mut got = moves_to(&host);
         got.sort();
-        assert_eq!(got, vec![("0xf00".to_string(), 1), ("0xf01".to_string(), 8)]);
+        assert_eq!(
+            got,
+            vec![("0xf00".to_string(), 1), ("0xf01".to_string(), 8)]
+        );
     }
 
     #[test]
@@ -2702,18 +4012,33 @@ mod tests {
     // ---- R2/R3: pointer-independent reproduction, one-generation convergence
 
     // The WS9 trees of playtest round 2 (window rectangles x0, y0, x1, y1): the same three windows
-    const WS9_B: [(i16, i16, i16, i16); 3] = [(12, 38, 953, 546), (12, 560, 953, 1068), (967, 38, 1908, 1068)];
-    const WS9_C: [(i16, i16, i16, i16); 3] = [(12, 38, 953, 1068), (967, 38, 1908, 546), (967, 560, 1908, 1068)];
+    const WS9_B: [(i32, i32, i32, i32); 3] = [
+        (12, 38, 953, 546),
+        (12, 560, 953, 1068),
+        (967, 38, 1908, 1068),
+    ];
+    const WS9_C: [(i32, i32, i32, i32); 3] = [
+        (12, 38, 953, 1068),
+        (967, 38, 1908, 546),
+        (967, 560, 1908, 1068),
+    ];
 
-    fn shape_saves(ws: i32, shape: &[(i16, i16, i16, i16)]) -> Vec<Client> {
-        let rects: Vec<_> = shape.iter().map(|&(x0, y0, x1, y1)| (x0, y0, x1 - x0, y1 - y0)).collect();
+    fn shape_saves(ws: i32, shape: &[(i32, i32, i32, i32)]) -> Vec<Client> {
+        let rects: Vec<_> = shape
+            .iter()
+            .map(|&(x0, y0, x1, y1)| (x0, y0, x1 - x0, y1 - y0))
+            .collect();
         tiled_saves(ws, &rects)
     }
 
     /// One load of `saves` onto the simulated compositor with the pointer at `pointer`; returns the
     /// "next save" (the saved clients with the geometry the compositor then reports), the report
     /// and the host
-    fn simulated_load(saves: &[Client], pointer: (i32, i32), warp: bool) -> (Vec<Client>, LoadReport, FakeHost) {
+    fn simulated_load(
+        saves: &[Client],
+        pointer: (i32, i32),
+        warp: bool,
+    ) -> (Vec<Client>, LoadReport, FakeHost) {
         let launch: Vec<usize> = (0..saves.len()).collect();
         let (entries, scripts) = launching(saves, &launch);
         let host = FakeHost::new(vec![], scripts).dwindle();
@@ -2726,7 +4051,11 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, saved)| {
-                let live = &windows.iter().find(|(_, c)| c.address.to_string() == format!("0xa{i:02x}")).unwrap().1;
+                let live = &windows
+                    .iter()
+                    .find(|(_, c)| c.address.to_string() == format!("0xa{i:02x}"))
+                    .unwrap()
+                    .1;
                 let mut next = saved.clone();
                 next.at = live.at;
                 next.size = live.size;
@@ -2737,7 +4066,7 @@ mod tests {
         (next, report, host)
     }
 
-    fn geometry(clients: &[Client]) -> Vec<((i16, i16), (i16, i16))> {
+    fn geometry(clients: &[Client]) -> Vec<((i32, i32), (i32, i32))> {
         clients.iter().map(|c| (c.at, c.size)).collect()
     }
 
@@ -2745,14 +4074,29 @@ mod tests {
     fn test_untreeable_by_growth_shape_round_trips_whatever_the_pointer() {
         // WS9's tree (full-height left, stack right) cannot be grown at a left-hand pointer by
         // insertion order alone; steering makes the pointer irrelevant
-        let pointers = [(300, 900), (561, 424), (1437, 553), (1500, 200), (960, 540), (100, 100)];
+        let pointers = [
+            (300, 900),
+            (561, 424),
+            (1437, 553),
+            (1500, 200),
+            (960, 540),
+            (100, 100),
+        ];
         for shape in [&WS9_B[..], &WS9_C[..]] {
             let a = shape_saves(7, shape);
             for &pointer in &pointers {
                 let (b, report, host) = simulated_load(&a, pointer, true);
                 assert_eq!(geometry(&b), geometry(&a), "pointer {pointer:?}: load of A");
                 assert!(report.flushes[0].steered);
-                assert_eq!(report.verification, vec![WorkspaceCheck { workspace: 7, at_saved: 3, checked: 3, off: vec![] }]);
+                assert_eq!(
+                    report.verification,
+                    vec![WorkspaceCheck {
+                        workspace: "7".into(),
+                        at_saved: 3,
+                        checked: 3,
+                        off: vec![]
+                    }]
+                );
                 // the pointer is where the user left it
                 assert_eq!(host.cursor.get(), Some(pointer));
                 // and the next generation, with the pointer somewhere else again, is identical
@@ -2769,7 +4113,10 @@ mod tests {
         let (b, report, _) = simulated_load(&a, (300, 900), false);
         assert_ne!(geometry(&b), geometry(&a));
         assert!(!report.flushes[0].steered);
-        assert!(report.verification[0].at_saved < report.verification[0].checked, "the load notices");
+        assert!(
+            report.verification[0].at_saved < report.verification[0].checked,
+            "the load notices"
+        );
     }
 
     #[test]
@@ -2796,7 +4143,7 @@ mod tests {
     }
 
     /// Window rectangles of an n-window tree grown by the same pointer-nearest rule
-    fn grown_shape(n: usize, pointer: (i32, i32)) -> Vec<(i16, i16, i16, i16)> {
+    fn grown_shape(n: usize, pointer: (i32, i32)) -> Vec<(i32, i32, i32, i32)> {
         let saves = tiled_saves(10, &vec![(0, 0, 1, 1); n]);
         let launch: Vec<usize> = (0..n).collect();
         let (entries, scripts) = launching(&saves, &launch);
@@ -2805,9 +4152,16 @@ mod tests {
         host.warp.set(false);
         host.cursor.set(Some(pointer));
         let mut plan = plan_for(entries, saves);
-        plan.saved = (0..n).map(|i| client(&format!("app{i}"), "t", 10, false, (0, 0), (1, 1))).collect();
+        plan.saved = (0..n)
+            .map(|i| client(&format!("app{i}"), "t", 10, false, (0, 0), (1, 1)))
+            .collect();
         run_load(&host, &plan);
-        let out = host.windows.borrow().iter().map(|(_, c)| (c.at.0, c.at.1, c.at.0 + c.size.0, c.at.1 + c.size.1)).collect();
+        let out = host
+            .windows
+            .borrow()
+            .iter()
+            .map(|(_, c)| (c.at.0, c.at.1, c.at.0 + c.size.0, c.at.1 + c.size.1))
+            .collect();
         out
     }
 
@@ -2820,8 +4174,16 @@ mod tests {
         // refused warp: nothing is attempted twice across workspaces, nothing is "restored"
         let (_, _, host) = simulated_load(&a, (123, 456), false);
         assert_eq!(host.cursor.get(), Some((123, 456)));
-        let warps = host.sent.borrow().iter().filter(|o| matches!(o, Op::MoveCursor { .. })).count();
-        assert_eq!(warps, 3, "one refused warp is retried three times, then given up");
+        let warps = host
+            .sent
+            .borrow()
+            .iter()
+            .filter(|o| matches!(o, Op::MoveCursor { .. }))
+            .count();
+        assert_eq!(
+            warps, 3,
+            "one refused warp is retried three times, then given up"
+        );
     }
 
     // ---- round 4: provenance, final verification, the start workspace, the pointer's origin
@@ -2829,14 +4191,17 @@ mod tests {
     fn proc_for(host: &FakeHost, pid: i32, argv: &[&str], cwd: &str) {
         host.procs.borrow_mut().insert(
             pid,
-            ProcessInfo { argv: argv.iter().map(|s| s.to_string()).collect(), cwd: Some(cwd.to_string()) },
+            ProcessInfo {
+                argv: argv.iter().map(|s| s.to_string()).collect(),
+                cwd: Some(cwd.to_string()),
+            },
         );
     }
 
-    fn foot_with_pid(n: i16, pid: i32, ws: i32) -> Client {
+    fn foot_with_pid(n: i32, pid: i32, ws: i32) -> Client {
         let mut c = foot_window(n);
         c.pid = pid;
-        c.workspace.id = ws;
+        c.workspace = Workspace::numbered(ws);
         c.workspace.name = ws.to_string();
         c
     }
@@ -2847,8 +4212,8 @@ mod tests {
     /// takes X's save.
     fn interleaved(with_provenance: bool) -> Vec<(String, i32)> {
         let saves = vec![
-            client("foot", "mike@omarchy:~", 3, false, (12, 38), (941, 1030)),
-            client("foot", "mike@omarchy:~", 10, false, (12, 38), (941, 1030)),
+            client("foot", "user@testhost:~", 3, false, (12, 38), (941, 1030)),
+            client("foot", "user@testhost:~", 10, false, (12, 38), (941, 1030)),
         ];
         let mut x = group_entry("foot /x", vec![0]);
         x.command = "cd /x && foot".into();
@@ -2856,7 +4221,10 @@ mod tests {
         y.command = "cd /y && foot".into();
         let host = FakeHost::new(
             vec![],
-            vec![vec![(LAUNCH_WAIT_TICKS + 20, foot_with_pid(0, 700, 9))], vec![(1, foot_with_pid(1, 701, 9))]],
+            vec![
+                vec![(LAUNCH_WAIT_TICKS + 20, foot_with_pid(0, 700, 9))],
+                vec![(1, foot_with_pid(1, 701, 9))],
+            ],
         );
         if with_provenance {
             proc_for(&host, 700, &["foot"], "/x");
@@ -2873,9 +4241,15 @@ mod tests {
     #[test]
     fn test_a_window_launched_for_one_entry_cannot_be_bound_to_another_entry_that_is_outstanding() {
         // X's window (0xf00) belongs on ws 3, Y's (0xf01) on ws 10, whichever arrives first
-        assert_eq!(interleaved(true), vec![("0xf00".to_string(), 3), ("0xf01".to_string(), 10)]);
+        assert_eq!(
+            interleaved(true),
+            vec![("0xf00".to_string(), 3), ("0xf01".to_string(), 10)]
+        );
         // control: without /proc provenance the quick window takes the first generic save, crossing them
-        assert_eq!(interleaved(false), vec![("0xf00".to_string(), 10), ("0xf01".to_string(), 3)]);
+        assert_eq!(
+            interleaved(false),
+            vec![("0xf00".to_string(), 10), ("0xf01".to_string(), 3)]
+        );
     }
 
     #[test]
@@ -2888,7 +4262,10 @@ mod tests {
             client("app1", "t", 3, false, (967, 38), (941, 1030)),
         ];
         let (entries, mut scripts) = launching(&saves, &[0, 1]);
-        scripts[1] = vec![(LAUNCH_WAIT_TICKS + SETTLE_TICKS + 20, live_window("app1", 1))];
+        scripts[1] = vec![(
+            LAUNCH_WAIT_TICKS + SETTLE_TICKS + 20,
+            live_window("app1", 1),
+        )];
         let host = FakeHost::new(vec![], scripts).dwindle();
         host.sim.set(true);
         let mut plan = plan_for(entries, saves);
@@ -2896,8 +4273,15 @@ mod tests {
         let report = run_load(&host, &plan);
         assert_eq!(report.flushes.len(), 1, "one flush for the whole workspace");
         assert_eq!(report.flushes[0].windows, 2);
-        assert_eq!(report.verification, vec![WorkspaceCheck { workspace: 3, at_saved: 2, checked: 2, off: vec![] }]);
-        assert_eq!(moved(&host), vec!["0xa00", "0xa01"]);
+        assert_eq!(
+            report.verification,
+            vec![WorkspaceCheck {
+                workspace: "3".into(),
+                at_saved: 2,
+                checked: 2,
+                off: vec![]
+            }]
+        );
     }
 
     #[test]
@@ -2911,7 +4295,13 @@ mod tests {
         let report = run_load(&host, &plan_for(entries, saves));
         // not simulating the compositor: the windows are not at their saved geometry, and it says so
         assert_eq!(report.verification.len(), 1);
-        assert_eq!((report.verification[0].workspace, report.verification[0].checked), (7, 2));
+        assert_eq!(
+            (
+                report.verification[0].workspace.as_str(),
+                report.verification[0].checked
+            ),
+            ("7", 2)
+        );
         assert_eq!(report.verification[0].off.len(), 2);
     }
 
@@ -2928,13 +4318,54 @@ mod tests {
         host.cursor.set(Some((123, 456)));
         let report = run_load(&host, &plan_for(entries, saves));
         let sent = host.sent.borrow();
-        let first_park = sent.iter().position(|o| matches!(o, Op::MoveToWorkspace { workspace: crate::dispatch::WorkspaceTarget::Special(_), .. })).unwrap();
-        let first_back = sent.iter().position(|o| matches!(o, Op::MoveToWorkspace { workspace: crate::dispatch::WorkspaceTarget::Id(9), .. })).unwrap();
-        let parks = sent.iter().filter(|o| matches!(o, Op::MoveToWorkspace { workspace: crate::dispatch::WorkspaceTarget::Special(_), .. })).count();
+        let first_park = sent
+            .iter()
+            .position(|o| {
+                matches!(
+                    o,
+                    Op::MoveToWorkspace {
+                        workspace: crate::dispatch::WorkspaceTarget::Special(_),
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let first_back = sent
+            .iter()
+            .position(|o| {
+                matches!(
+                    o,
+                    Op::MoveToWorkspace {
+                        workspace: crate::dispatch::WorkspaceTarget::Id(9),
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let parks = sent
+            .iter()
+            .filter(|o| {
+                matches!(
+                    o,
+                    Op::MoveToWorkspace {
+                        workspace: crate::dispatch::WorkspaceTarget::Special(_),
+                        ..
+                    }
+                )
+            })
+            .count();
         assert_eq!(parks, 3);
         assert!(first_park < first_back);
         drop(sent);
-        assert_eq!(report.verification, vec![WorkspaceCheck { workspace: 9, at_saved: 3, checked: 3, off: vec![] }]);
+        assert_eq!(
+            report.verification,
+            vec![WorkspaceCheck {
+                workspace: "9".into(),
+                at_saved: 3,
+                checked: 3,
+                off: vec![]
+            }]
+        );
         assert!(report.flushes[0].steered);
     }
 
@@ -2943,11 +4374,17 @@ mod tests {
         let saves = shape_saves(9, &WS9_C);
         let (entries, scripts) = launching(&saves, &[0, 1, 2]);
         let stranger = foot_with_pid(40, 900, 9);
-        let host = FakeHost::new(vec![stranger], scripts).dwindle();
+        let host = FakeHost::new(vec![stranger.clone()], scripts).dwindle();
         host.start.set(9);
-        run_load(&host, &plan_for(entries, saves));
-        let parked = host.sent.borrow().iter().any(|o| matches!(o, Op::MoveToWorkspace { workspace: crate::dispatch::WorkspaceTarget::Special(_), .. }));
-        assert!(!parked, "an unrelated window would be swept into the rebuild");
+        let report = run_load(&host, &plan_for(entries, saves));
+        assert!(report.incomplete);
+        assert_eq!(
+            host.clients()
+                .unwrap()
+                .into_iter()
+                .find(|c| c.address == stranger.address),
+            Some(stranger)
+        );
     }
 
     #[test]
@@ -2960,13 +4397,22 @@ mod tests {
         host.origin.set(Some((111, 222)));
         host.cursor.set(Some((1866, 121)));
         let mut plan = plan_for(entries, saves);
-        plan.restore_workspace = Some(4);
+        plan.restore_workspace = Some("4".into());
         run_load(&host, &plan);
         assert_eq!(host.cursor.get(), Some((111, 222)));
         let sent = host.sent.borrow();
-        let focus = sent.iter().position(|o| matches!(o, Op::FocusWorkspace(4))).unwrap();
-        let last_warp = sent.iter().rposition(|o| matches!(o, Op::MoveCursor { .. })).unwrap();
-        assert!(focus < last_warp, "focusing can move the pointer, so it is restored after it");
+        let focus = sent
+            .iter()
+            .position(|o| matches!(o, Op::FocusWorkspace(ws) if ws == "4"))
+            .unwrap();
+        let last_warp = sent
+            .iter()
+            .rposition(|o| matches!(o, Op::MoveCursor { .. }))
+            .unwrap();
+        assert!(
+            focus < last_warp,
+            "focusing can move the pointer, so it is restored after it"
+        );
     }
 
     #[test]
@@ -2974,18 +4420,39 @@ mod tests {
         let mut e = group_entry("x", vec![0]);
         e.command = "cd /home/m && foot --working-directory=/p".into();
         let sig = entry_signature(&e).unwrap();
-        assert_eq!(sig, (vec!["foot".to_string(), "--working-directory=/p".to_string()], Some("/home/m".to_string())));
-        let info = |argv: &[&str], cwd: &str| ProcessInfo { argv: argv.iter().map(|s| s.to_string()).collect(), cwd: Some(cwd.into()) };
-        assert!(process_matches(&sig, &info(&["/usr/bin/foot", "--working-directory=/p"], "/home/m")));
-        assert!(!process_matches(&sig, &info(&["foot", "--working-directory=/p"], "/elsewhere")));
-        assert!(!process_matches(&sig, &info(&["foot"], "/home/m")));
+        assert_eq!(
+            sig,
+            (
+                vec!["foot".to_string(), "--working-directory=/p".to_string()],
+                Some("/home/m".to_string())
+            )
+        );
+        assert!(process_matches(
+            &sig,
+            &["/usr/bin/foot".into(), "--working-directory=/p".into()],
+            Some("/home/m"),
+        ));
+        assert!(!process_matches(
+            &sig,
+            &["foot".into(), "--working-directory=/p".into()],
+            Some("/elsewhere"),
+        ));
+        assert!(!process_matches(&sig, &["foot".into()], Some("/home/m")));
         e.command = "foot".into();
         assert_eq!(entry_signature(&e).unwrap().1, None);
     }
 
     // The round-3 fixtures (brief section 3), as geometry: WS4 = V(H(foot, playcall), Lions); WS10 = V(brave, H(foot, codex))
-    const FIXTURE_WS4: [(i16, i16, i16, i16); 3] = [(12, 38, 953, 546), (967, 38, 1908, 1068), (12, 560, 953, 1068)];
-    const FIXTURE_WS10: [(i16, i16, i16, i16); 3] = [(12, 38, 953, 1068), (967, 38, 1908, 546), (967, 560, 1908, 1068)];
+    const FIXTURE_WS4: [(i32, i32, i32, i32); 3] = [
+        (12, 38, 953, 546),
+        (967, 38, 1908, 1068),
+        (12, 560, 953, 1068),
+    ];
+    const FIXTURE_WS10: [(i32, i32, i32, i32); 3] = [
+        (12, 38, 953, 1068),
+        (967, 38, 1908, 546),
+        (967, 560, 1908, 1068),
+    ];
 
     #[test]
     fn test_ws4_fixture_round_trips_even_when_the_first_window_of_the_tree_arrives_last() {
@@ -2993,7 +4460,10 @@ mod tests {
         // Lions, playcall-gui, then it. Nothing is placed until all three are there, then in schedule order.
         let saves = shape_saves(4, &FIXTURE_WS4);
         let (entries, mut scripts) = launching(&saves, &[1, 2, 0]);
-        scripts[2] = vec![(LAUNCH_WAIT_TICKS + SETTLE_TICKS + 30, live_window("app0", 0))];
+        scripts[2] = vec![(
+            LAUNCH_WAIT_TICKS + SETTLE_TICKS + 30,
+            live_window("app0", 0),
+        )];
         let host = FakeHost::new(vec![], scripts).dwindle();
         host.sim.set(true);
         host.cursor.set(Some((1866, 121)));
@@ -3001,7 +4471,15 @@ mod tests {
         plan.tail_ticks = 4 * LAUNCH_WAIT_TICKS;
         let report = run_load(&host, &plan);
         assert_eq!(report.flushes.len(), 1);
-        assert_eq!(report.verification, vec![WorkspaceCheck { workspace: 4, at_saved: 3, checked: 3, off: vec![] }]);
+        assert_eq!(
+            report.verification,
+            vec![WorkspaceCheck {
+                workspace: "4".into(),
+                at_saved: 3,
+                checked: 3,
+                off: vec![]
+            }]
+        );
         // and the next generation, pointer elsewhere, is the same
         let (b, _, _) = simulated_load(&saves, (300, 900), true);
         assert_eq!(geometry(&b), geometry(&saves));
@@ -3014,12 +4492,693 @@ mod tests {
         // the windows are born on ws 10 (the load was started there)
         let scripts: Vec<Vec<(u64, Client)>> = scripts
             .into_iter()
-            .map(|v| v.into_iter().map(|(d, mut c)| { c.workspace.id = 10; c.workspace.name = "10".into(); (d, c) }).collect())
+            .map(|v| {
+                v.into_iter()
+                    .map(|(d, mut c)| {
+                        c.workspace = Workspace::numbered(10);
+                        c.workspace.name = "10".into();
+                        (d, c)
+                    })
+                    .collect()
+            })
             .collect();
         let host = FakeHost::new(vec![], scripts).dwindle();
         host.sim.set(true);
         host.start.set(10);
         let report = run_load(&host, &plan_for(entries, saves));
-        assert_eq!(report.verification, vec![WorkspaceCheck { workspace: 10, at_saved: 3, checked: 3, off: vec![] }]);
+        assert_eq!(
+            report.verification,
+            vec![WorkspaceCheck {
+                workspace: "10".into(),
+                at_saved: 3,
+                checked: 3,
+                off: vec![]
+            }]
+        );
+    }
+    #[test]
+    fn scoped_adjustment_accepts_bare_named_workspace_alias() {
+        let mut saved = client("notes", "notes", 1, false, (12, 38), (1896, 1030));
+        saved.workspace = Workspace::from_selector("name:Work");
+        let host = FakeHost::new(vec![saved.clone()], vec![]).dwindle();
+        let mut plan = plan_for(vec![], vec![saved]);
+        plan.scope = Some("Work".into());
+        plan.tail_ticks = 1;
+        let report = run_load(&host, &plan);
+        assert_eq!(report.placed, 1);
+        assert!(report.unmatched.is_empty());
+    }
+
+    #[test]
+    fn process_identity_restores_window_after_its_app_id_changes() {
+        let saved = client("browser-old", "document", 3, true, (30, 40), (640, 480));
+        let mut live = live_window("browser-new", 0);
+        live.pid = 700;
+        let host = FakeHost::new(vec![], vec![vec![(1, live)]]);
+        host.procs.borrow_mut().insert(
+            700,
+            ProcessInfo {
+                argv: vec!["/usr/bin/browser".into()],
+                cwd: None,
+            },
+        );
+        let report = run_load(
+            &host,
+            &plan_for(vec![group_entry("/usr/bin/browser", vec![0])], vec![saved]),
+        );
+        assert!(
+            report.unmatched.is_empty(),
+            "a proven process must survive an app-id rename"
+        );
+        assert_eq!(host.clients().unwrap()[0].workspace.selector(), "3");
+    }
+
+    #[test]
+    fn packed_process_argv_restores_a_renamed_application() {
+        let saved = client("browser-old", "document", 3, false, (50, 0), (1, 1));
+        let mut live = live_window("browser-new", 0);
+        live.pid = 700;
+        let host = FakeHost::new(vec![], vec![vec![(1, live)]]);
+        proc_for(
+            &host,
+            700,
+            &["/usr/bin/browser --profile 'two words'"],
+            "/projects/a b",
+        );
+        let report = run_load(
+            &host,
+            &plan_for(
+                vec![group_entry(
+                    "cd '/projects/a b' && /usr/bin/browser --profile 'two words'",
+                    vec![0],
+                )],
+                vec![saved],
+            ),
+        );
+        assert!(report.unmatched.is_empty());
+        assert_eq!(host.clients().unwrap()[0].workspace.selector(), "3");
+    }
+
+    #[test]
+    fn renamed_application_requires_matching_arguments_and_directory() {
+        for (argv, cwd) in [
+            (
+                vec!["/usr/bin/browser --profile 'other words'"],
+                "/projects/a b",
+            ),
+            (
+                vec!["/usr/bin/browser", "--profile two", "words"],
+                "/projects/a b",
+            ),
+            (vec!["/usr/bin/browser --profile 'two words'"], "/elsewhere"),
+            (
+                vec!["/opt/other/browser", "--profile", "two words"],
+                "/projects/a b",
+            ),
+            (vec!["", "--profile", "two words"], "/projects/a b"),
+            (vec![], "/projects/a b"),
+        ] {
+            let saved = client("browser-old", "document", 3, false, (50, 0), (1, 1));
+            let mut live = live_window("browser-new", 0);
+            live.pid = 700;
+            let host = FakeHost::new(vec![], vec![vec![(1, live)]]);
+            proc_for(&host, 700, &argv, cwd);
+            let report = run_load(
+                &host,
+                &plan_for(
+                    vec![group_entry(
+                        "cd '/projects/a b' && /usr/bin/browser --profile 'two words'",
+                        vec![0],
+                    )],
+                    vec![saved],
+                ),
+            );
+            assert_eq!(report.unmatched.len(), 1, "{argv:?} in {cwd}");
+            assert_eq!(host.clients().unwrap()[0].workspace.selector(), "9");
+        }
+    }
+
+    #[test]
+    fn unrelated_slow_launch_does_not_delay_ready_applications() {
+        let saves = vec![
+            client("slow", "slow", 2, true, (10, 10), (640, 480)),
+            client("fast", "fast", 3, true, (20, 20), (640, 480)),
+        ];
+        let host = FakeHost::new(
+            vec![],
+            vec![
+                vec![(LAUNCH_WAIT_TICKS, live_window("slow", 0))],
+                vec![(1, live_window("fast", 1))],
+            ],
+        );
+        let report = run_load(
+            &host,
+            &plan_for(
+                vec![group_entry("slow", vec![0]), group_entry("fast", vec![1])],
+                saves,
+            ),
+        );
+        assert!(report.unmatched.is_empty());
+        let fast_due = host
+            .windows
+            .borrow()
+            .iter()
+            .find(|(_, c)| c.class == "fast")
+            .unwrap()
+            .0;
+        assert!(
+            fast_due < LAUNCH_WAIT_TICKS,
+            "fast GUI was not launched until the slow one completed"
+        );
+    }
+
+    #[test]
+    fn foreign_tiled_window_does_not_strand_claims_in_stage() {
+        let saves = tiled_saves(2, &[(12, 38, 941, 1030), (967, 38, 941, 1030)]);
+        let (entries, scripts) = launching(&saves, &[0, 1]);
+        let foreign = client("foreign", "foreign", 2, false, (0, 0), (100, 100));
+        let foreign_address = foreign.address.clone();
+        let host = FakeHost::new(vec![foreign], scripts).dwindle();
+        let report = run_load(&host, &plan_for(entries, saves));
+        assert!(report.incomplete);
+        let live = host.clients().unwrap();
+        assert!(live
+            .iter()
+            .filter(|c| c.class.starts_with("app"))
+            .all(|c| c.workspace.selector() == "2"));
+        assert!(!host.sent.borrow().iter().any(
+            |op| matches!(op, Op::MoveToWorkspace { window, .. } if *window == foreign_address)
+        ));
+    }
+
+    #[test]
+    fn merge_shared_workspace_preserves_foreign_tiled_window() {
+        let saves = tiled_saves(2, &[(12, 38, 941, 1030), (967, 38, 941, 1030)]);
+        let (entries, scripts) = launching(&saves, &[0, 1]);
+        let foreign = client("foreign", "foreign", 2, false, (0, 0), (100, 100));
+        let mut host = FakeHost::new(vec![foreign.clone()], scripts).dwindle();
+        host.merge = true;
+        let report = run_load(&host, &plan_for(entries, saves));
+        assert!(!report.incomplete, "{report:?}");
+        assert!(report.unmatched.is_empty());
+        let current = host.clients().unwrap();
+        let foreign_after = current
+            .iter()
+            .find(|c| c.address == foreign.address)
+            .unwrap();
+        assert_eq!(foreign_after.workspace.selector(), "2");
+        assert!(!foreign_after.floating);
+        assert!(!host.sent.borrow().iter().any(
+            |op| matches!(op, Op::MoveToWorkspace { window, .. } if *window == foreign.address)
+        ));
+    }
+
+    #[test]
+    fn merge_unshared_workspace_still_rejects_bad_geometry() {
+        let saves = tiled_saves(3, &[(12, 38, 941, 1030)]);
+        let (entries, scripts) = launching(&saves, &[0]);
+        let foreign = client("foreign", "foreign", 2, false, (0, 0), (100, 100));
+        let mut host = FakeHost::new(vec![foreign], scripts);
+        host.merge = true;
+        let report = run_load(&host, &plan_for(entries, saves));
+        assert!(report.incomplete, "{report:?}");
+        assert_eq!(report.verification[0].off.len(), 1);
+    }
+
+    #[test]
+    fn merge_shared_workspace_still_rejects_bad_floating_geometry() {
+        let saved = client("app", "t", 2, true, (200, 200), (640, 480));
+        let mut launched = live_window("app", 0);
+        launched.floating = true;
+        let foreign = client("foreign", "foreign", 2, false, (0, 0), (100, 100));
+        let mut host = FakeHost::new(vec![foreign], vec![vec![(1, launched)]]);
+        host.merge = true;
+        let report = run_load(
+            &host,
+            &plan_for(vec![group_entry("app", vec![0])], vec![saved]),
+        );
+        assert!(report.incomplete, "{report:?}");
+        assert_eq!(report.verification[0].off.len(), 1);
+    }
+
+    #[test]
+    fn merge_reuses_preexisting_renamed_application_with_packed_argv() {
+        let saved = client("browser-old", "document", 3, false, (50, 0), (1, 1));
+        let mut live = live_window("browser-new", 0);
+        live.pid = 700;
+        let duplicate = live_window("browser-new", 1);
+        let mut host = FakeHost::new(vec![live.clone()], vec![vec![(1, duplicate)]]);
+        host.merge = true;
+        proc_for(
+            &host,
+            700,
+            &["/usr/bin/browser --profile 'two words'"],
+            "/projects/a b",
+        );
+        let report = run_load(
+            &host,
+            &plan_for(
+                vec![group_entry(
+                    "cd '/projects/a b' && /usr/bin/browser --profile 'two words'",
+                    vec![0],
+                )],
+                vec![saved],
+            ),
+        );
+        assert!(report.unmatched.is_empty(), "{report:?}");
+        let current = host.clients().unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].address, live.address);
+        assert_eq!(current[0].pid, 700);
+        assert_eq!(current[0].workspace.selector(), "3");
+    }
+
+    #[test]
+    fn merge_does_not_claim_conflicting_same_class_window() {
+        let saved = client("browser", "saved document", 3, false, (50, 0), (1, 1));
+        let mut foreign = live_window("browser", 0);
+        foreign.title = "other document".into();
+        foreign.pid = 700;
+        let mut launched = live_window("browser", 1);
+        launched.title = "saved document".into();
+        let mut host = FakeHost::new(vec![foreign.clone()], vec![vec![(1, launched.clone())]]);
+        host.merge = true;
+        proc_for(&host, 700, &["/usr/bin/other-browser"], "/elsewhere");
+        let report = run_load(
+            &host,
+            &plan_for(vec![group_entry("/usr/bin/browser", vec![0])], vec![saved]),
+        );
+        assert!(report.unmatched.is_empty(), "{report:?}");
+        let current = host.clients().unwrap();
+        assert_eq!(
+            current
+                .iter()
+                .find(|c| c.address == foreign.address)
+                .unwrap()
+                .workspace
+                .selector(),
+            "9"
+        );
+        assert_eq!(
+            current
+                .iter()
+                .find(|c| c.address == launched.address)
+                .unwrap()
+                .workspace
+                .selector(),
+            "3"
+        );
+    }
+
+    #[test]
+    fn merge_reuses_exact_class_and_title_without_matching_launcher() {
+        let saved = client("appimage", "My application", 3, false, (50, 0), (1, 1));
+        let mut live = live_window("appimage", 0);
+        live.title = "My application".into();
+        live.pid = 700;
+        let duplicate = live_window("appimage", 1);
+        let mut host = FakeHost::new(vec![live.clone()], vec![vec![(1, duplicate)]]);
+        host.merge = true;
+        proc_for(&host, 700, &["/tmp/.mount_app/usr/bin/app"], "/tmp");
+        let report = run_load(
+            &host,
+            &plan_for(
+                vec![group_entry("/home/user/app.AppImage", vec![0])],
+                vec![saved],
+            ),
+        );
+        assert!(report.unmatched.is_empty(), "{report:?}");
+        let current = host.clients().unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].address, live.address);
+        assert_eq!(current[0].pid, 700);
+        assert_eq!(current[0].workspace.selector(), "3");
+    }
+
+    #[test]
+    fn merge_late_conflicting_window_is_not_claimed() {
+        let saved = client("browser", "saved", 3, false, (50, 0), (1, 1));
+        let mut foreign = live_window("browser", 0);
+        foreign.title = "other".into();
+        foreign.pid = 700;
+        let mut expected = live_window("browser", 1);
+        expected.title = "saved".into();
+        expected.pid = 701;
+        let mut host = FakeHost::new(
+            vec![],
+            vec![vec![(1, foreign.clone()), (1, expected.clone())]],
+        );
+        host.merge = true;
+        proc_for(&host, 700, &["/usr/bin/other"], "/");
+        proc_for(&host, 701, &["/usr/bin/browser"], "/");
+        let report = run_load(
+            &host,
+            &plan_for(vec![group_entry("/usr/bin/browser", vec![0])], vec![saved]),
+        );
+        assert!(report.unmatched.is_empty(), "{report:?}");
+        let live = host.clients().unwrap();
+        assert_eq!(
+            live.iter()
+                .find(|c| c.address == foreign.address)
+                .unwrap()
+                .workspace
+                .selector(),
+            "9"
+        );
+        assert_eq!(
+            live.iter()
+                .find(|c| c.address == expected.address)
+                .unwrap()
+                .workspace
+                .selector(),
+            "3"
+        );
+    }
+
+    #[test]
+    fn merge_late_foreign_tiled_window_shares_only_its_workspace() {
+        let saved = client("app", "t", 2, false, (12, 38), (941, 1030));
+        let foreign = client("foreign", "foreign", 2, false, (0, 0), (100, 100));
+        let expected = live_window("app", 0);
+        let mut host = FakeHost::new(
+            vec![],
+            vec![vec![(1, foreign.clone()), (1, expected.clone())]],
+        );
+        host.merge = true;
+        let report = run_load(
+            &host,
+            &plan_for(vec![group_entry("app", vec![0])], vec![saved]),
+        );
+        assert!(!report.incomplete, "{report:?}");
+        let live = host.clients().unwrap();
+        assert_eq!(
+            live.iter()
+                .find(|c| c.address == foreign.address)
+                .unwrap()
+                .workspace
+                .selector(),
+            "2"
+        );
+        assert_eq!(
+            live.iter()
+                .find(|c| c.address == expected.address)
+                .unwrap()
+                .workspace
+                .selector(),
+            "2"
+        );
+    }
+
+    #[test]
+    fn merge_reuses_renamed_window_arriving_before_its_entry_launches() {
+        let first = client("first", "t", 2, false, (50, 0), (1, 1));
+        let second = client("old-id", "saved", 3, false, (51, 0), (1, 1));
+        let first_live = live_window("first", 0);
+        let mut existing = live_window("new-id", 1);
+        existing.pid = 701;
+        let duplicate = live_window("new-id", 2);
+        let mut host = FakeHost::new(
+            vec![],
+            vec![
+                vec![(0, existing.clone()), (1, first_live)],
+                vec![(1, duplicate)],
+            ],
+        );
+        host.merge = true;
+        proc_for(&host, 701, &["/usr/bin/second"], "/");
+        let report = run_load(
+            &host,
+            &plan_for(
+                vec![
+                    group_entry("first", vec![0]),
+                    group_entry("/usr/bin/second", vec![1]),
+                ],
+                vec![first, second],
+            ),
+        );
+        assert!(report.unmatched.is_empty(), "{report:?}");
+        let live = host.clients().unwrap();
+        assert_eq!(live.len(), 2);
+        assert_eq!(
+            live.iter()
+                .find(|c| c.address == existing.address)
+                .unwrap()
+                .workspace
+                .selector(),
+            "3"
+        );
+    }
+
+    #[test]
+    fn merge_reconsiders_initial_window_after_title_changes() {
+        let saved = client("app", "ready", 3, false, (50, 0), (1, 1));
+        let mut existing = live_window("app", 0);
+        existing.title = "starting".into();
+        let mut host = FakeHost::new(vec![existing.clone()], vec![]);
+        host.merge = true;
+        host.title_updates
+            .borrow_mut()
+            .push((1, existing.address.clone(), "ready".into()));
+        let report = run_load(
+            &host,
+            &plan_for(vec![group_entry("/usr/bin/app", vec![0])], vec![saved]),
+        );
+        assert!(report.unmatched.is_empty(), "{report:?}");
+        let live = host.clients().unwrap();
+        assert_eq!(live[0].address, existing.address);
+        assert_eq!(live[0].workspace.selector(), "3");
+    }
+
+    #[test]
+    fn merge_scoped_late_foreign_stays_outside_while_proven_app_moves_in() {
+        let saved = client("app-old", "saved", 3, false, (51, 0), (1, 1));
+        let mut expected = live_window("app-new", 1);
+        expected.pid = 701;
+        let mut foreign = live_window("app-old", 0);
+        foreign.title = "other".into();
+        foreign.pid = 700;
+        let mut host = FakeHost::new(
+            vec![],
+            vec![vec![(1, foreign.clone()), (1, expected.clone())]],
+        );
+        host.merge = true;
+        proc_for(&host, 700, &["/usr/bin/other"], "/");
+        proc_for(&host, 701, &["/usr/bin/app"], "/");
+        let mut plan = plan_for(vec![group_entry("/usr/bin/app", vec![0])], vec![saved]);
+        plan.scope = Some("3".into());
+        let report = run_load(&host, &plan);
+        assert!(report.unmatched.is_empty(), "{report:?}");
+        let live = host.clients().unwrap();
+        assert_eq!(
+            live.iter()
+                .find(|c| c.address == foreign.address)
+                .unwrap()
+                .workspace
+                .selector(),
+            "9"
+        );
+        assert_eq!(
+            live.iter()
+                .find(|c| c.address == expected.address)
+                .unwrap()
+                .workspace
+                .selector(),
+            "3"
+        );
+    }
+
+    #[test]
+    fn merge_proven_group_cannot_claim_other_groups_matching_title() {
+        let saves = vec![
+            client("app", "first", 2, false, (50, 0), (1, 1)),
+            client("app", "second", 2, false, (51, 0), (1, 1)),
+            client("app", "other", 3, false, (52, 0), (1, 1)),
+        ];
+        let mut existing = live_window("app", 0);
+        existing.title = "other".into();
+        existing.pid = 700;
+        let mut first = live_window("app", 1);
+        first.title = "first".into();
+        first.pid = 700;
+        let mut other = live_window("app", 2);
+        other.title = "other".into();
+        other.pid = 701;
+        let mut host = FakeHost::new(
+            vec![existing.clone()],
+            vec![vec![(1, first)], vec![(1, other.clone())]],
+        );
+        host.merge = true;
+        proc_for(&host, 700, &["/usr/bin/a"], "/");
+        proc_for(&host, 701, &["/usr/bin/b"], "/");
+        let report = run_load(
+            &host,
+            &plan_for(
+                vec![
+                    group_entry("/usr/bin/a", vec![0, 1]),
+                    group_entry("/usr/bin/b", vec![2]),
+                ],
+                saves,
+            ),
+        );
+        assert!(report.unmatched.is_empty(), "{report:?}");
+        let live = host.clients().unwrap();
+        assert_ne!(
+            live.iter()
+                .find(|c| c.address == existing.address)
+                .unwrap()
+                .workspace
+                .selector(),
+            "3"
+        );
+        assert_eq!(
+            live.iter()
+                .find(|c| c.address == other.address)
+                .unwrap()
+                .workspace
+                .selector(),
+            "3"
+        );
+    }
+
+    #[test]
+    fn missing_steer_anchor_does_not_strand_survivor_in_stage() {
+        let saves = tiled_saves(2, &[(12, 38, 941, 1030), (967, 38, 941, 1030)]);
+        let rects: Vec<_> = saves
+            .iter()
+            .map(|c| {
+                (
+                    c.at.0 as f64,
+                    c.at.1 as f64,
+                    (c.at.0 + c.size.0) as f64,
+                    (c.at.1 + c.size.1) as f64,
+                )
+            })
+            .collect();
+        let steps = dwindle::steer_schedule(&rects, 1.0, dwindle::CUT_TOLERANCE).unwrap();
+        let survivor = steps[1].window;
+        let (entries, mut scripts) = launching(&saves, &[0, 1]);
+        scripts[steps[0].window].clear();
+        let host = FakeHost::new(vec![], scripts).dwindle();
+        let report = run_load(&host, &plan_for(entries, saves));
+        assert!(report.incomplete);
+        let live = host.clients().unwrap();
+        assert_eq!(
+            live.iter()
+                .find(|c| c.class == format!("app{survivor}"))
+                .unwrap()
+                .workspace
+                .selector(),
+            "2"
+        );
+    }
+
+    #[test]
+    fn identical_process_signatures_match_saved_titles_in_reverse_arrival_order() {
+        let saves = vec![
+            client("app", "first", 2, true, (10, 10), (640, 480)),
+            client("app", "second", 3, true, (10, 10), (640, 480)),
+        ];
+        let mut first = live_window("app", 0);
+        first.title = "first".into();
+        first.pid = 700;
+        let mut second = live_window("app", 1);
+        second.title = "second".into();
+        second.pid = 701;
+        let host = FakeHost::new(vec![], vec![vec![(2, first)], vec![(1, second)]]);
+        for pid in [700, 701] {
+            host.procs.borrow_mut().insert(
+                pid,
+                ProcessInfo {
+                    argv: vec!["app".into()],
+                    cwd: None,
+                },
+            );
+        }
+        let report = run_load(
+            &host,
+            &plan_for(
+                vec![group_entry("app", vec![0]), group_entry("app", vec![1])],
+                saves,
+            ),
+        );
+        assert!(report.unmatched.is_empty());
+        let mut moves = moves_to(&host);
+        moves.sort();
+        assert_eq!(moves, vec![("0xa00".into(), 2), ("0xa01".into(), 3)]);
+    }
+
+    #[test]
+    fn restoration_waits_for_final_geometry_acknowledgements() {
+        let live = live_window("app", 1);
+        let mut saved = live.clone();
+        saved.workspace = Workspace::from_selector("7");
+        saved.size = (100, 100);
+        let host = FakeHost::new(vec![], vec![vec![(1, live)]]);
+        host.geometry_updates.borrow_mut().push((5, saved.clone()));
+        let report = run_load(
+            &host,
+            &plan_for(vec![group_entry("app", vec![0])], vec![saved]),
+        );
+        assert!(!report.incomplete);
+        assert_eq!(report.verification[0].at_saved, 1);
+    }
+
+    #[test]
+    fn saved_tray_gui_is_revealed_and_placed() {
+        let saved = client("tray-app", "document", 3, false, (50, 0), (1, 1));
+        let host = FakeHost::new(vec![], vec![vec![]]);
+        *host.tray_window.borrow_mut() = Some(live_window("tray-app", 0));
+        let report = run_load(
+            &host,
+            &plan_for(vec![group_entry("/usr/bin/tray-app", vec![0])], vec![saved]),
+        );
+        assert!(report.unmatched.is_empty());
+        assert!(!report.incomplete);
+        let windows = host.clients().unwrap();
+        assert_eq!(windows[0].workspace.selector(), "3");
+    }
+
+    #[test]
+    fn mapped_gui_is_not_toggled_through_its_tray() {
+        let saved = client("tray-app", "document", 3, false, (50, 0), (1, 1));
+        let host = FakeHost::new(vec![], vec![vec![(1, live_window("tray-app", 0))]]);
+        *host.tray_window.borrow_mut() = Some(live_window("extra", 1));
+        let report = run_load(
+            &host,
+            &plan_for(vec![group_entry("/usr/bin/tray-app", vec![0])], vec![saved]),
+        );
+        assert!(report.unmatched.is_empty());
+        let windows = host.clients().unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].class, "tray-app");
+        assert_eq!(windows[0].workspace.selector(), "3");
+    }
+
+    #[test]
+    fn literal_executable_path_with_spaces_is_not_packed_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let literal = dir.path().join("browser --profile work");
+        std::fs::write(&literal, "#!/bin/sh\n").unwrap();
+        let saved = client("browser-old", "document", 3, false, (50, 0), (1, 1));
+        let mut live = live_window("browser-new", 0);
+        live.pid = 700;
+        let host = FakeHost::new(vec![], vec![vec![(1, live)]]);
+        proc_for(
+            &host,
+            700,
+            &[literal.to_str().unwrap()],
+            dir.path().to_str().unwrap(),
+        );
+        let command = format!(
+            "cd {} && {} --profile work",
+            shell_quote(dir.path().to_str().unwrap()),
+            shell_quote(dir.path().join("browser").to_str().unwrap())
+        );
+        let report = run_load(
+            &host,
+            &plan_for(vec![group_entry(&command, vec![0])], vec![saved]),
+        );
+        assert_eq!(report.unmatched.len(), 1);
+        assert_eq!(host.clients().unwrap()[0].workspace.selector(), "9");
     }
 }

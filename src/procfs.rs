@@ -26,7 +26,13 @@ pub fn parse_stat(text: &str) -> Option<ProcStat> {
     // state ppid pgrp session tty_nr tpgid ...
     let mut fields = rest.split_whitespace().skip(1);
     let mut next = || fields.next()?.parse::<i32>().ok();
-    Some(ProcStat { ppid: next()?, pgrp: next()?, session: next()?, tty_nr: next()?, tpgid: next()? })
+    Some(ProcStat {
+        ppid: next()?,
+        pgrp: next()?,
+        session: next()?,
+        tty_nr: next()?,
+        tpgid: next()?,
+    })
 }
 
 pub trait ProcFs {
@@ -50,7 +56,8 @@ impl ProcFs for RealProc {
     fn pids(&self) -> Vec<i32> {
         fs::read_dir("/proc")
             .map(|dir| {
-                dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok()).collect()
+                dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+                    .collect()
             })
             .unwrap_or_default()
     }
@@ -164,28 +171,51 @@ impl ProcTable {
 }
 
 /// Look inside a terminal process: find its shell, and the foreground program if any
-pub fn capture_terminal(proc: &dyn ProcFs, table: &ProcTable, terminal_pid: i32) -> TerminalCapture {
+pub fn capture_terminal(
+    proc: &dyn ProcFs,
+    table: &ProcTable,
+    terminal_pid: i32,
+) -> TerminalCapture {
     let shells = table.shells(terminal_pid);
     let shell = match shells.as_slice() {
         [] => return TerminalCapture::default(),
         [shell] => *shell,
-        _ => return TerminalCapture { ambiguous: true, ..Default::default() },
+        _ => {
+            return TerminalCapture {
+                ambiguous: true,
+                ..Default::default()
+            }
+        }
     };
-    let mut capture = TerminalCapture { shell_cwd: proc.cwd(shell), ..Default::default() };
-    let Some(shell_stat) = table.stats.get(&shell) else { return capture };
+    let mut capture = TerminalCapture {
+        shell_cwd: proc.cwd(shell),
+        ..Default::default()
+    };
+    let Some(shell_stat) = table.stats.get(&shell) else {
+        return capture;
+    };
 
     // A terminal relaunched by hyprsession runs its resumed program under a non-interactive
     // `sh -c` wrapper without job control: the program shares the wrapper's process group, so
     // the foreground probe below sees "the shell". While the wrapper is still the terminal's
     // shell the program is running, and the wrapper's own arguments name it. (Once the program
     // ends the wrapper execs the user's shell, whose argv carries no marker: nothing recorded.)
-    if let Some((cwd, command)) = proc.argv(shell).as_deref().and_then(crate::resume::wrapper_program) {
+    if let Some((cwd, command)) = proc
+        .argv(shell)
+        .as_deref()
+        .and_then(crate::resume::wrapper_program)
+    {
         let descendants = table.descendants(shell);
         if descendants.contains(&proc.own_pid()) {
             return capture;
         }
         let mut group_pids = vec![shell];
-        group_pids.extend(descendants.iter().copied().filter(|p| table.stats.get(p).is_some_and(|s| s.pgrp == shell_stat.pgrp)));
+        group_pids.extend(descendants.iter().copied().filter(|p| {
+            table
+                .stats
+                .get(p)
+                .is_some_and(|s| s.pgrp == shell_stat.pgrp)
+        }));
         capture.foreground = Some(ForegroundCapture {
             pid: shell,
             argv: crate::command_detection::shell_split(&command),
@@ -209,10 +239,14 @@ pub fn capture_terminal(proc: &dyn ProcFs, table: &ProcTable, terminal_pid: i32)
         .collect();
     group.sort_unstable();
     // Normally the group leader; if it has exited (a pipeline's first stage), the lowest pid left
-    let leader = if group.contains(&fg_group) { fg_group } else { match group.first() {
-        Some(&pid) => pid,
-        None => return capture,
-    } };
+    let leader = if group.contains(&fg_group) {
+        fg_group
+    } else {
+        match group.first() {
+            Some(&pid) => pid,
+            None => return capture,
+        }
+    };
     // When hyprsession itself was run from the terminal (`hyprsession save`), it is the
     // terminal's foreground job. That is not a program to bring back: treat the shell as foreground.
     let descendants = table.descendants(leader);
@@ -220,7 +254,9 @@ pub fn capture_terminal(proc: &dyn ProcFs, table: &ProcTable, terminal_pid: i32)
     if group.contains(&own) || descendants.contains(&own) {
         return capture;
     }
-    let Some(argv) = proc.argv(leader) else { return capture };
+    let Some(argv) = proc.argv(leader) else {
+        return capture;
+    };
     capture.foreground = Some(ForegroundCapture {
         pid: leader,
         argv,
@@ -251,25 +287,59 @@ pub mod fake {
     }
 
     impl FakeProc {
-        pub fn add(&mut self, pid: i32, ppid: i32, pgrp: i32, session: i32, tty_nr: i32, tpgid: i32, argv: &[&str], cwd: &str) {
-            self.procs.insert(pid, FakeEntry {
-                stat: ProcStat { ppid, pgrp, session, tty_nr, tpgid },
-                argv: argv.iter().map(|s| s.to_string()).collect(),
-                cwd: Some(cwd.to_string()),
-            });
+        pub fn add(
+            &mut self,
+            pid: i32,
+            ppid: i32,
+            pgrp: i32,
+            session: i32,
+            tty_nr: i32,
+            tpgid: i32,
+            argv: &[&str],
+            cwd: &str,
+        ) {
+            self.procs.insert(
+                pid,
+                FakeEntry {
+                    stat: ProcStat {
+                        ppid,
+                        pgrp,
+                        session,
+                        tty_nr,
+                        tpgid,
+                    },
+                    argv: argv.iter().map(|s| s.to_string()).collect(),
+                    cwd: Some(cwd.to_string()),
+                },
+            );
         }
     }
 
     impl ProcFs for FakeProc {
-        fn own_pid(&self) -> i32 { self.own }
-        fn pids(&self) -> Vec<i32> { self.procs.keys().copied().collect() }
-        fn stat(&self, pid: i32) -> Option<ProcStat> { self.procs.get(&pid).map(|p| p.stat) }
-        fn argv(&self, pid: i32) -> Option<Vec<String>> {
-            self.procs.get(&pid).map(|p| p.argv.clone()).filter(|a| !a.is_empty())
+        fn own_pid(&self) -> i32 {
+            self.own
         }
-        fn cwd(&self, pid: i32) -> Option<String> { self.procs.get(&pid).and_then(|p| p.cwd.clone()) }
+        fn pids(&self) -> Vec<i32> {
+            self.procs.keys().copied().collect()
+        }
+        fn stat(&self, pid: i32) -> Option<ProcStat> {
+            self.procs.get(&pid).map(|p| p.stat)
+        }
+        fn argv(&self, pid: i32) -> Option<Vec<String>> {
+            self.procs
+                .get(&pid)
+                .map(|p| p.argv.clone())
+                .filter(|a| !a.is_empty())
+        }
+        fn cwd(&self, pid: i32) -> Option<String> {
+            self.procs.get(&pid).and_then(|p| p.cwd.clone())
+        }
         fn exe_name(&self, pid: i32) -> Option<String> {
-            self.procs.get(&pid)?.argv.first().map(|a| a.rsplit('/').next().unwrap_or(a).to_string())
+            self.procs
+                .get(&pid)?
+                .argv
+                .first()
+                .map(|a| a.rsplit('/').next().unwrap_or(a).to_string())
         }
     }
 
@@ -279,7 +349,16 @@ pub mod fake {
         let mut p = FakeProc::default();
         p.add(1, 0, 1, 1, 0, -1, &["init"], "/");
         p.add(100, 1, 100, 100, 0, -1, &["foot"], "/home/synthetic");
-        p.add(101, 100, 101, 101, 5, 101, &["-zsh"], "/home/synthetic/shell-dir");
+        p.add(
+            101,
+            100,
+            101,
+            101,
+            5,
+            101,
+            &["-zsh"],
+            "/home/synthetic/shell-dir",
+        );
         p
     }
 
@@ -303,7 +382,16 @@ mod tests {
     fn test_parse_stat_handles_awkward_comm() {
         let line = "4242 (my (weird) prog) S 100 4242 4242 34817 4242 4194304 1 0";
         let s = parse_stat(line).unwrap();
-        assert_eq!(s, ProcStat { ppid: 100, pgrp: 4242, session: 4242, tty_nr: 34817, tpgid: 4242 });
+        assert_eq!(
+            s,
+            ProcStat {
+                ppid: 100,
+                pgrp: 4242,
+                session: 4242,
+                tty_nr: 34817,
+                tpgid: 4242
+            }
+        );
         assert!(parse_stat("garbage").is_none());
         assert!(parse_stat("1 (x) S 1 2").is_none());
     }
@@ -341,7 +429,10 @@ mod tests {
         // The terminal process was launched from /home/synthetic; the shell has cd'd
         let p = terminal_with_shell();
         assert_eq!(p.cwd(100).as_deref(), Some("/home/synthetic"));
-        assert_eq!(capture(&p, 100).shell_cwd.as_deref(), Some("/home/synthetic/shell-dir"));
+        assert_eq!(
+            capture(&p, 100).shell_cwd.as_deref(),
+            Some("/home/synthetic/shell-dir")
+        );
     }
 
     #[test]
@@ -370,7 +461,12 @@ mod tests {
     fn test_the_capturing_process_as_foreground_leader_records_nothing() {
         // `hyprsession save` run from the terminal is the terminal's foreground job
         let mut p = terminal_with_shell();
-        run_in_foreground(&mut p, 200, &["hyprsession", "save"], "/home/synthetic/proj");
+        run_in_foreground(
+            &mut p,
+            200,
+            &["hyprsession", "save"],
+            "/home/synthetic/proj",
+        );
         p.own = 200;
         let c = capture(&p, 100);
         assert_eq!(c.foreground, None);
@@ -383,7 +479,16 @@ mod tests {
         // e.g. `cargo run -- save`: the leader is a wrapper, hyprsession is its descendant
         let mut p = terminal_with_shell();
         run_in_foreground(&mut p, 200, &["cargo", "run"], "/home/synthetic/proj");
-        p.add(201, 200, 201, 101, 5, 200, &["hyprsession", "save"], "/home/synthetic/proj");
+        p.add(
+            201,
+            200,
+            201,
+            101,
+            5,
+            200,
+            &["hyprsession", "save"],
+            "/home/synthetic/proj",
+        );
         p.own = 201;
         let c = capture(&p, 100);
         assert_eq!(c.foreground, None);
@@ -393,7 +498,12 @@ mod tests {
     #[test]
     fn test_the_capturing_process_elsewhere_in_the_foreground_group_records_nothing() {
         let mut p = terminal_with_shell();
-        run_in_foreground(&mut p, 200, &["sh", "-c", "hyprsession save | tee log"], "/tmp");
+        run_in_foreground(
+            &mut p,
+            200,
+            &["sh", "-c", "hyprsession save | tee log"],
+            "/tmp",
+        );
         p.add(202, 101, 200, 101, 5, 200, &["hyprsession", "save"], "/tmp");
         p.own = 202;
         assert_eq!(capture(&p, 100).foreground, None);
@@ -413,9 +523,23 @@ mod tests {
     #[test]
     fn test_descendants_of_the_leader_are_collected() {
         let mut p = terminal_with_shell();
-        run_in_foreground(&mut p, 200, &["sh", "./playcall-gui"], "/home/synthetic/proj");
+        run_in_foreground(
+            &mut p,
+            200,
+            &["sh", "./playcall-gui"],
+            "/home/synthetic/proj",
+        );
         // The script's child, in the same pty session but another group
-        p.add(201, 200, 201, 101, 5, 200, &["playcall-gui"], "/home/synthetic/proj");
+        p.add(
+            201,
+            200,
+            201,
+            101,
+            5,
+            200,
+            &["playcall-gui"],
+            "/home/synthetic/proj",
+        );
         p.add(202, 201, 201, 101, 5, 200, &["helper"], "/");
         let fg = capture(&p, 100).foreground.unwrap();
         assert_eq!(fg.descendant_pids, vec![201, 202]);
@@ -445,7 +569,10 @@ mod tests {
         p.add(100, 1, 100, 100, 0, -1, &["alacritty"], "/");
         p.add(150, 100, 100, 100, 0, -1, &["helper"], "/");
         p.add(151, 150, 151, 151, 7, 151, &["bash"], "/home/synthetic");
-        assert_eq!(capture(&p, 100).shell_cwd.as_deref(), Some("/home/synthetic"));
+        assert_eq!(
+            capture(&p, 100).shell_cwd.as_deref(),
+            Some("/home/synthetic")
+        );
     }
 }
 
@@ -484,7 +611,9 @@ mod real_proc_tests {
         let capture = found.expect("foreground program was not found");
         let foreground = capture.foreground.unwrap();
         // Don't leave the sleep behind
-        let _ = std::process::Command::new("kill").arg(foreground.pid.to_string()).status();
+        let _ = std::process::Command::new("kill")
+            .arg(foreground.pid.to_string())
+            .status();
         assert_eq!(foreground.argv, vec!["sleep".to_string(), "30".to_string()]);
         assert!(capture.shell_cwd.is_some());
     }

@@ -1,11 +1,16 @@
-use hyprland::data::{Client, Clients, FullscreenMode, Workspace};
-use hyprland::shared::{HyprData, HyprDataActive};
 use crate::command_detection::fetch_command;
-use crate::procfs::{capture_terminal, ProcFs, ProcTable, RealProc};
-use crate::resume::{default_resume_path, program_identity, strip_wrapper, terminal_style, Relaunch, ResumeConfig};
-use serde::{Deserialize, Serialize};
 use crate::dispatch::{Dialect, Dispatcher, Op, WorkspaceTarget};
-use crate::load::{clear_windows, RuleWorkspace, Scope, desired_from_rules, launch_entries_with, launch_order, placeholder_client, parse_exec_conf, run_load, ClearConfig, LoadPlan, RealHost};
+use crate::ipc::{self, Client, WorkspaceKind};
+use crate::load::{
+    clear_windows, desired_from_rules, launch_entries_with, launch_order, placeholder_client,
+    run_load, ClearConfig, Host, LoadPlan, RealHost, Scope,
+};
+use crate::procfs::{capture_terminal, ProcFs, ProcTable, RealProc};
+use crate::resume::{
+    default_resume_path, program_identity, strip_wrapper, terminal_style, Relaunch, ResumeConfig,
+};
+use hyprland::data::FullscreenMode;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -16,16 +21,24 @@ pub trait Session {
     fn save(&self, name: &str) -> hyprland::Result<()>;
     fn load(&self, name: &str) -> hyprland::Result<()>;
     fn clear(&self) -> hyprland::Result<()>;
-    fn list(&self) -> impl Iterator<Item=String>;
+    fn list(&self) -> impl Iterator<Item = String>;
     fn delete(&self, name: &str);
 }
 
 macro_rules! iif {
     ($prop:expr, $val:expr) => {
-        if $prop { $val } else { "" }
+        if $prop {
+            $val
+        } else {
+            ""
+        }
     };
     ($prop:expr, $val:expr, $alt:expr) => {
-        if $prop { $val } else { $alt }
+        if $prop {
+            $val
+        } else {
+            $alt
+        }
     };
 }
 
@@ -70,7 +83,9 @@ pub struct Foreground {
 impl From<SavedClient> for serde_json::Value {
     fn from(saved: SavedClient) -> Self {
         let mut value = serde_json::to_value(&saved.client).expect("Client serializes to JSON");
-        let object = value.as_object_mut().expect("Client serializes to an object");
+        let object = value
+            .as_object_mut()
+            .expect("Client serializes to an object");
         if let Some(argv) = saved.argv {
             object.insert("argv".to_string(), serde_json::json!(argv));
         }
@@ -91,20 +106,35 @@ impl TryFrom<serde_json::Value> for SavedClient {
         // Both extras are optional: snapshots from before they existed lack them
         let (argv, cwd, foreground) = match value.as_object_mut() {
             Some(object) => (
-                object.remove("argv").and_then(|v| serde_json::from_value(v).ok()),
-                object.remove("cwd").and_then(|v| serde_json::from_value(v).ok()),
-                object.remove("foreground").and_then(|v| serde_json::from_value(v).ok()),
+                object
+                    .remove("argv")
+                    .and_then(|v| serde_json::from_value(v).ok()),
+                object
+                    .remove("cwd")
+                    .and_then(|v| serde_json::from_value(v).ok()),
+                object
+                    .remove("foreground")
+                    .and_then(|v| serde_json::from_value(v).ok()),
             ),
             None => (None, None, None),
         };
-        Ok(SavedClient { client: serde_json::from_value(value)?, argv, cwd, foreground })
+        Ok(SavedClient {
+            client: serde_json::from_value(value)?,
+            argv,
+            cwd,
+            foreground,
+        })
     }
 }
 
 impl SavedClient {
     /// Record every window of a snapshot. Terminal windows also get the program in the
     /// foreground of their tty, linked when that program owns another saved window.
-    pub fn capture_all(clients: &[Client], proc: &dyn ProcFs, resume: &ResumeConfig) -> Vec<SavedClient> {
+    pub fn capture_all(
+        clients: &[Client],
+        proc: &dyn ProcFs,
+        resume: &ResumeConfig,
+    ) -> Vec<SavedClient> {
         let mut table: Option<ProcTable> = None;
         let mut captured: Vec<(SavedClient, Vec<i32>)> = vec![];
         for client in clients {
@@ -116,7 +146,11 @@ impl SavedClient {
                 .as_deref()
                 .and_then(program_identity)
                 .filter(|n| resume.is_terminal(n))
-                .or_else(|| proc.exe_name(client.pid).map(|n| n.to_lowercase()).filter(|n| resume.is_terminal(n)));
+                .or_else(|| {
+                    proc.exe_name(client.pid)
+                        .map(|n| n.to_lowercase())
+                        .filter(|n| resume.is_terminal(n))
+                });
             if let Some(name) = name {
                 if clients.iter().filter(|c| c.pid == client.pid).count() > 1 {
                     println!(
@@ -137,8 +171,18 @@ impl SavedClient {
                         cwd = found.shell_cwd;
                     }
                     if let Some(fg) = found.foreground {
-                        related_pids = fg.group_pids.iter().chain(&fg.descendant_pids).copied().collect();
-                        foreground = Some(Foreground { pid: fg.pid, argv: fg.argv, cwd: fg.cwd, linked: false });
+                        related_pids = fg
+                            .group_pids
+                            .iter()
+                            .chain(&fg.descendant_pids)
+                            .copied()
+                            .collect();
+                        foreground = Some(Foreground {
+                            pid: fg.pid,
+                            argv: fg.argv,
+                            cwd: fg.cwd,
+                            linked: false,
+                        });
                     }
                 }
                 // A terminal relaunched by hyprsession carries its wrapper: record the terminal itself
@@ -146,7 +190,15 @@ impl SavedClient {
                     *argv = strip_wrapper(argv, terminal_style(&name));
                 }
             }
-            captured.push((SavedClient { client: client.clone(), argv, cwd, foreground }, related_pids));
+            captured.push((
+                SavedClient {
+                    client: client.clone(),
+                    argv,
+                    cwd,
+                    foreground,
+                },
+                related_pids,
+            ));
         }
 
         // A foreground program that is (or whose process group or descendants include) another
@@ -156,7 +208,9 @@ impl SavedClient {
             .into_iter()
             .map(|(mut saved, related)| {
                 if let Some(fg) = saved.foreground.as_mut() {
-                    fg.linked = related.iter().any(|pid| *pid != saved.client.pid && pids.contains(pid));
+                    fg.linked = related
+                        .iter()
+                        .any(|pid| *pid != saved.client.pid && pids.contains(pid));
                 }
                 saved
             })
@@ -189,7 +243,13 @@ pub fn fingerprint_with(clients: &[SavedClient], resume: &ResumeConfig) -> Vec<S
             };
             format!(
                 "{}|{}|{}|{:?}|{:?}|{:?}|{}",
-                k.class, k.workspace.id, k.floating, k.at, k.size, c.argv, foreground
+                k.class,
+                k.workspace.selector(),
+                k.floating,
+                k.at,
+                k.size,
+                c.argv,
+                foreground
             )
         })
         .collect();
@@ -203,84 +263,119 @@ fn write_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> 
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, contents)?;
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(contents)?;
+    file.sync_all()?;
     std::fs::rename(&tmp, path)
 }
 
 /// Write both snapshot files for a session directory
-fn write_snapshot(base_dir: &std::path::Path, exec_lines: &[String], saved: &[SavedClient]) -> std::io::Result<()> {
+fn write_snapshot(
+    base_dir: &std::path::Path,
+    exec_lines: &[String],
+    saved: &[SavedClient],
+) -> std::io::Result<()> {
     let mut exec = String::new();
     for line in exec_lines {
         exec.push_str(line);
         exec.push('\n');
     }
     write_atomic(&base_dir.join(EXEC_NAME), exec.as_bytes())?;
-    write_atomic(&base_dir.join(CLIENTS_PATH_NAME), &serde_json::to_vec(saved)?)
+    write_atomic(
+        &base_dir.join(CLIENTS_PATH_NAME),
+        &serde_json::to_vec(saved)?,
+    )
 }
 
 pub struct LocalSession {
     pub base_path: String,
     pub simulate: bool,
-    pub load_time:  u64, 
+    pub load_time: u64,
     pub adjust_clients_only: bool,
+    pub merge: bool,
     pub save_duplicate_pids: bool,
     pub dialect: Dialect,
     /// Load only this workspace's slice of the snapshot
-    pub workspace: Option<i32>,
+    pub workspace: Option<String>,
 }
 
 /// Work out which dispatches bring a live window in line with its saved client
 pub fn plan_adjustment(real_client: &Client, session_client: &Client) -> Vec<Op> {
     let window = real_client.address.clone();
     let mut ops = vec![];
-
-    // Anonymous special workspace (id -99) has no documented Lua form: deferred
-    let anonymous_special = session_client.workspace.id == -99;
-    if anonymous_special {
-        println!(
-            "Warning: skipping workspace placement of '{}': anonymous special workspaces are not supported",
-            real_client.title
-        );
-    } else {
-        if real_client.workspace.id != session_client.workspace.id {
-            let workspace = match session_client.workspace.name.strip_prefix("special:") {
-                Some(name) => WorkspaceTarget::Special(name.to_string()),
-                None => WorkspaceTarget::Id(session_client.workspace.id),
-            };
-            ops.push(Op::MoveToWorkspace { window: window.clone(), workspace });
-        }
-        if real_client.monitor != session_client.monitor && session_client.workspace.id > 0 {
-            ops.push(Op::MoveWorkspaceToMonitor {
-                workspace: session_client.workspace.id,
-                monitor: session_client.monitor.unwrap_or(0),
-            });
-        }
-    }
-    if real_client.floating != session_client.floating {
-        ops.push(Op::Float { window: window.clone(), enable: session_client.floating });
-    }
-    if real_client.pinned != session_client.pinned {
-        ops.push(Op::Pin { window: window.clone() });
-    }
-    if real_client.fullscreen != session_client.fullscreen
-        && session_client.fullscreen != FullscreenMode::None
-    {
-        ops.push(Op::Fullscreen {
+    if real_client.pinned && !session_client.pinned {
+        ops.push(Op::Pin {
             window: window.clone(),
-            maximized: session_client.fullscreen == FullscreenMode::Maximized,
+            enable: false,
         });
     }
-    // Tiled windows take their geometry from the layout: only floating ones are placed
+    let shape_changed = real_client.floating != session_client.floating
+        || (session_client.floating
+            && (real_client.at != session_client.at || real_client.size != session_client.size));
+    let clear_fullscreen = real_client.fullscreen != FullscreenMode::None
+        && (shape_changed || real_client.fullscreen != session_client.fullscreen);
+    if clear_fullscreen {
+        ops.push(Op::Fullscreen {
+            window: window.clone(),
+            maximized: real_client.fullscreen == FullscreenMode::Maximized,
+            enable: false,
+        });
+    }
+    if real_client.workspace.selector() != session_client.workspace.selector() {
+        let workspace = WorkspaceTarget::from_workspace(&session_client.workspace);
+        ops.push(Op::MoveToWorkspace {
+            window: window.clone(),
+            workspace,
+        });
+    }
+    if real_client.monitor != session_client.monitor
+        && session_client.workspace.kind == WorkspaceKind::Normal
+    {
+        ops.push(Op::MoveWorkspaceToMonitor {
+            workspace: session_client.workspace.selector().to_owned(),
+            monitor: session_client.monitor.unwrap_or(0),
+        });
+    }
+    if real_client.floating != session_client.floating {
+        ops.push(Op::Float {
+            window: window.clone(),
+            enable: session_client.floating,
+        });
+    }
     if session_client.floating && session_client.fullscreen == FullscreenMode::None {
+        // Resize preserves the window centre in Hyprland; set its position last.
+        ops.push(Op::ResizeWindow {
+            window: window.clone(),
+            w: session_client.size.0,
+            h: session_client.size.1,
+        });
         ops.push(Op::MoveWindow {
             window: window.clone(),
             x: session_client.at.0,
             y: session_client.at.1,
         });
-        ops.push(Op::ResizeWindow {
+    }
+    if session_client.pinned && !real_client.pinned {
+        ops.push(Op::Pin {
+            window: window.clone(),
+            enable: true,
+        });
+    }
+    if session_client.fullscreen != FullscreenMode::None
+        && (clear_fullscreen || real_client.fullscreen != session_client.fullscreen)
+    {
+        ops.push(Op::Fullscreen {
             window,
-            w: session_client.size.0,
-            h: session_client.size.1,
+            maximized: session_client.fullscreen == FullscreenMode::Maximized,
+            enable: true,
         });
     }
     ops
@@ -290,10 +385,13 @@ impl LocalSession {
     fn clear_scope(&self, scope: Scope) -> hyprland::Result<()> {
         if !self.simulate {
             let host = RealHost::new(Dispatcher::new(self.dialect, false));
-            let report = clear_windows(&host, &ClearConfig::default(), scope)
+            let report = clear_windows(&host, &ClearConfig::default(), scope.clone())
                 .map_err(hyprland::error::HyprError::Other)?;
             if !report.refused.is_empty() {
-                println!("Not closed (shared with another workspace): {}", report.refused.join(", "));
+                println!(
+                    "Not closed (shared with another workspace): {}",
+                    report.refused.join(", ")
+                );
             }
         }
 
@@ -312,68 +410,42 @@ impl LocalSession {
         self.prepare_load_with(base_dir, &resume)
     }
 
-    fn prepare_load_with(&self, base_dir: &std::path::Path, resume: &ResumeConfig) -> hyprland::Result<LoadPlan> {
-        let fail = |msg: String| hyprland::error::HyprError::Other(msg);
-
-        let saved: Vec<SavedClient> = match std::fs::read_to_string(base_dir.join(CLIENTS_PATH_NAME)) {
-            Ok(data) => serde_json::from_str(&data)
-                .map_err(|e| fail(format!("{} is not valid: {e}", CLIENTS_PATH_NAME)))?,
-            Err(_) => vec![],
-        };
-
-        let mut entries = vec![];
-        if !self.adjust_clients_only {
-            let exec_path = base_dir.join(EXEC_NAME);
-            let text = std::fs::read_to_string(&exec_path)
-                .map_err(|e| fail(format!("cannot read {}: {e}", exec_path.display())))?;
-            entries = parse_exec_conf(&text).map_err(fail)?;
-            if entries.is_empty() {
-                return Err(fail(format!("{} contains no launch lines", exec_path.display())));
-            }
-            for entry in entries.iter().filter(|e| !e.rules.unknown.is_empty()) {
-                println!("Warning: ignoring unknown rules {:?} for '{}'", entry.rules.unknown, entry.command);
+    fn prepare_load_with(
+        &self,
+        base_dir: &std::path::Path,
+        resume: &ResumeConfig,
+    ) -> hyprland::Result<LoadPlan> {
+        let data = std::fs::read(base_dir.join(CLIENTS_PATH_NAME))?;
+        let mut saved: Vec<SavedClient> = serde_json::from_slice(&data)?;
+        if let Some(workspace) = &self.workspace {
+            saved.retain(|c| c.client.workspace.matches_selector(workspace));
+            if saved.is_empty() {
+                return Err(hyprland::error::HyprError::Other(format!(
+                    "No saved windows on workspace {workspace}"
+                )));
             }
         }
-
-        // New-format snapshots (argv recorded) place every saved window by class.
-        // Old ones only know their launch lines, so each launch's window is placed by
-        // that line's rules.
-        let new_format = saved.iter().any(|c| c.argv.is_some());
-        let place_by_class = self.adjust_clients_only || new_format;
-
-        // A scoped load works on one workspace's slice of the snapshot only
-        let saved: Vec<SavedClient> = match self.workspace {
-            Some(workspace) => {
-                let slice: Vec<SavedClient> =
-                    saved.into_iter().filter(|c| c.client.workspace.id == workspace).collect();
-                if place_by_class && slice.is_empty() {
-                    return Err(fail(format!("the snapshot has no windows on workspace {workspace}")));
-                }
-                slice
-            }
-            None => saved,
+        let entries = if self.adjust_clients_only {
+            vec![]
+        } else {
+            launch_entries_with(
+                &saved,
+                &crate::command_faker::build_xdg_command_map(),
+                &|dir| dir.is_dir(),
+                resume,
+            )
         };
-
-        // New-format snapshots launch exactly what was recorded (argv); exec.conf has
-        // been validated above but its lines went through command heuristics and
-        // remain the launch source only for legacy snapshots
-        if new_format && !self.adjust_clients_only {
-            entries = launch_entries_with(&saved, &crate::command_faker::build_xdg_command_map(), &|dir| dir.is_dir(), resume);
-        } else if let Some(workspace) = self.workspace {
-            // Legacy launch lines carry their workspace in their rules
-            entries.retain(|e| e.rules.workspace == Some(RuleWorkspace::Id(workspace)));
-            if entries.is_empty() && !self.adjust_clients_only {
-                return Err(fail(format!("the snapshot has no launch lines for workspace {workspace}")));
-            }
-        }
-
         Ok(LoadPlan {
             entries: launch_order(entries),
-            saved: if place_by_class { saved.into_iter().map(|c| c.client).collect() } else { vec![] },
-            place_by_class,
+            saved: saved.into_iter().map(|c| c.client).collect(),
+            place_by_class: true,
             tail_ticks: LoadPlan::tail_ticks_for(self.load_time),
-            scope: self.workspace,
-            restore_workspace: if self.simulate { None } else { Workspace::get_active().ok().map(|w| w.id) },
+            scope: self.workspace.clone(),
+            restore_workspace: if self.simulate {
+                None
+            } else {
+                Some(ipc::active_workspace()?.selector().to_owned())
+            },
         })
     }
 }
@@ -381,10 +453,9 @@ impl LocalSession {
 /// Print what a load would send. Windows to place do not exist yet, so their
 /// dispatches are shown against a placeholder address.
 fn simulate_load(dispatcher: &Dispatcher, plan: &LoadPlan) {
-    if let Some(workspace) = plan.scope {
+    if let Some(workspace) = &plan.scope {
         println!(
-            "Scoped to workspace {workspace}: closing only its windows (a process shared with another \
-             workspace is closed gracefully, never signalled) and launching {} programs",
+            "Scoped to workspace {workspace}: refusing existing windows and launching {} programs",
             plan.entries.len()
         );
     }
@@ -400,18 +471,26 @@ fn simulate_load(dispatcher: &Dispatcher, plan: &LoadPlan) {
         }
     }
     if plan.place_by_class {
-        println!("After placement, windows matched by no saved client will be listed (not touched)");
+        println!(
+            "After placement, windows matched by no saved client will be listed (not touched)"
+        );
         print_placement_order(&plan.saved);
         for wanted in &plan.saved {
             for op in plan_adjustment(&placeholder_client(), wanted) {
-                println!("Would send once the window exists: dispatch {}", dispatcher.render(&op));
+                println!(
+                    "Would send once the window exists: dispatch {}",
+                    dispatcher.render(&op)
+                );
             }
         }
     } else {
         for entry in &plan.entries {
             let blank = placeholder_client();
             for op in plan_adjustment(&blank, &desired_from_rules(&blank, &entry.rules)) {
-                println!("Would send once the window exists: dispatch {}", dispatcher.render(&op));
+                println!(
+                    "Would send once the window exists: dispatch {}",
+                    dispatcher.render(&op)
+                );
             }
         }
     }
@@ -421,7 +500,7 @@ fn simulate_load(dispatcher: &Dispatcher, plan: &LoadPlan) {
 /// on the live compositor (layout options and the pointer), so a simulation can only promise the
 /// fallback: saved reading order.
 fn print_placement_order(saved: &[Client]) {
-    let mut workspaces: Vec<(i32, String)> = vec![];
+    let mut workspaces: Vec<&str> = vec![];
     for client in saved.iter().filter(|c| crate::queue::is_queued(c)) {
         let key = crate::queue::ws_key(client);
         if !workspaces.contains(&key) {
@@ -433,20 +512,29 @@ fn print_placement_order(saved: &[Client]) {
         let rects: Vec<crate::dwindle::Rect> = saved
             .iter()
             .filter(|c| crate::queue::is_queued(c) && crate::queue::ws_key(c) == key)
-            .map(|c| (c.at.0 as f64, c.at.1 as f64, (c.at.0 + c.size.0) as f64, (c.at.1 + c.size.1) as f64))
+            .map(|c| {
+                (
+                    c.at.0 as f64,
+                    c.at.1 as f64,
+                    f64::from(c.at.0) + f64::from(c.size.0),
+                    f64::from(c.at.1) + f64::from(c.size.1),
+                )
+            })
             .collect();
         let titles: Vec<&str> = saved
             .iter()
             .filter(|c| crate::queue::is_queued(c) && crate::queue::ws_key(c) == key)
             .map(|c| c.title.as_str())
             .collect();
-        let reading: Vec<String> =
-            crate::dwindle::reading_order(&rects).into_iter().map(|i| format!("'{}'", titles[i])).collect();
+        let reading: Vec<String> = crate::dwindle::reading_order(&rects)
+            .into_iter()
+            .map(|i| format!("'{}'", titles[i]))
+            .collect();
         println!(
             "Workspace {}: its {} tiled windows are placed together once claimed, in the computed dwindle \
              insertion order (decided at load time from the pointer; saved reading order if the tree is \
              unreachable): reading order would be {}",
-            key.0,
+            key,
             rects.len(),
             reading.join(", ")
         );
@@ -459,11 +547,18 @@ fn print_flushes(flushes: &[crate::load::FlushReport]) {
         let how = match (&flush.fallback, flush.steered) {
             (_, true) => "steered insertion order (pointer-independent)".to_string(),
             (None, false) => "computed insertion order".to_string(),
-            (Some(reason), false) => format!("saved reading order ({reason}); the layout may not reproduce"),
+            (Some(reason), false) => {
+                format!("saved reading order ({reason}); the layout may not reproduce")
+            }
         };
-        println!("Workspace {}: {} tiled windows placed in {how}", flush.workspace, flush.windows);
+        println!(
+            "Workspace {}: {} tiled windows placed in {how}",
+            flush.workspace, flush.windows
+        );
         if flush.pointer_moved {
-            println!("  the pointer moved during placement; the order may not have been reproduced");
+            println!(
+                "  the pointer moved during placement; the order may not have been reproduced"
+            );
         }
     }
 }
@@ -472,10 +567,13 @@ fn print_flushes(flushes: &[crate::load::FlushReport]) {
 fn print_verification(checks: &[crate::load::WorkspaceCheck]) {
     for check in checks {
         if check.at_saved == check.checked {
-            println!("Workspace {}: all {} tiled windows are at their saved geometry", check.workspace, check.checked);
+            println!(
+                "Workspace {}: all {} windows match the saved state and geometry",
+                check.workspace, check.checked
+            );
         } else {
             println!(
-                "Warning: workspace {}: only {} of {} tiled windows are at their saved geometry (off: {})",
+                "Warning: workspace {}: only {} of {} windows match the saved state and geometry (off: {})",
                 check.workspace,
                 check.at_saved,
                 check.checked,
@@ -490,7 +588,10 @@ fn print_shortfalls(shortfalls: &[crate::load::GroupShortfall], unmatched: &[Cli
     if shortfalls.is_empty() {
         return;
     }
-    println!("Launch groups short of their saved window count: {}", shortfalls.len());
+    println!(
+        "Launch groups short of their saved window count: {}",
+        shortfalls.len()
+    );
     for short in shortfalls {
         println!(
             "  '{}': {} of {} windows after {} extra launches",
@@ -498,7 +599,12 @@ fn print_shortfalls(shortfalls: &[crate::load::GroupShortfall], unmatched: &[Cli
         );
     }
     for client in unmatched {
-        println!("  unmatched save: '{}' ({}) workspace={}", client.title, client.class, client.workspace.id);
+        println!(
+            "  unmatched save: '{}' ({}) workspace={}",
+            client.title,
+            client.class,
+            client.workspace.selector()
+        );
     }
 }
 
@@ -511,7 +617,10 @@ fn print_surplus(surplus: &[Client]) {
     for window in surplus {
         println!(
             "  surplus {} class='{}' title='{}' workspace={}",
-            window.address, window.class, window.title, window.workspace.id
+            window.address,
+            window.class,
+            window.title,
+            window.workspace.selector()
         );
     }
 }
@@ -520,21 +629,23 @@ impl Session for LocalSession {
     fn save(&self, name: &str) -> hyprland::Result<()> {
         println!("Saving session: {}", name);
         let base_dir: PathBuf = to_base_dir!(self.base_path.clone(), name.to_string());
-        std::fs::create_dir_all(&base_dir).expect("Failed to create session directory");
+        std::fs::create_dir_all(&base_dir)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&base_dir, std::fs::Permissions::from_mode(0o700))?;
 
         let props = [
             |info: &Client| format!("monitor {:?}", info.monitor.unwrap_or(0)),
-            |info: &Client| iif!(info.workspace.id == -99,
-                                format!("workspace special silent"),
-                                format!("workspace {} silent", info.workspace.id)),
-            |info: &Client| format!("{}", iif!(info.floating, "float")),
+            |info: &Client| format!("workspace {} silent", info.workspace.selector()),
+            |info: &Client| iif!(info.floating, "float").to_string(),
             |info: &Client| format!("move {} {}", info.at.0, info.at.1),
             |info: &Client| format!("size {} {}", info.size.0, info.size.1),
-            |info: &Client| format!("{}", iif!(info.pinned, "pin")),
+            |info: &Client| iif!(info.pinned, "pin").to_string(),
             |info: &Client| format!("fullscreenstate {}", info.fullscreen as i32),
         ];
 
-        let client_info = Clients::get().expect("Unable to fetch clients");
+        let mut client_info = ipc::clients()?;
+        client_info.retain(ipc::restorable);
+        client_info.reverse();
 
         let mut pids: Vec<i32> = vec![];
         let mut saved_clients: Vec<SavedClient> = vec![];
@@ -545,7 +656,7 @@ impl Session for LocalSession {
             println!("Warning: {e}; using the built-in resume table");
             ResumeConfig::default()
         });
-        let ordered: Vec<Client> = client_info.iter().rev().cloned().collect();
+        let ordered = client_info;
         let captured = SavedClient::capture_all(&ordered, &RealProc, &resume);
 
         for (info, saved) in ordered.iter().zip(captured) {
@@ -569,8 +680,7 @@ impl Session for LocalSession {
             exec_lines.push(format!("[{}] {}", exec_opts.join(";"), cmd.unwrap()));
         }
 
-        write_snapshot(&base_dir, &exec_lines, &saved_clients)
-            .expect("Failed to write session files");
+        write_snapshot(&base_dir, &exec_lines, &saved_clients)?;
         println!("Session saved");
         Ok(())
     }
@@ -587,20 +697,40 @@ impl Session for LocalSession {
         if self.simulate {
             simulate_load(&dispatcher, &plan);
         } else {
-            // The pointer's starting position is captured here, before anything is closed
-            let host = RealHost::new(dispatcher);
-            if !self.adjust_clients_only {
-                match self.workspace {
-                    Some(workspace) => self.clear_scope(Scope::Workspace(workspace))?,
-                    None => self.clear()?,
-                }
+            let host = if self.merge {
+                RealHost::merged(dispatcher)
+            } else {
+                RealHost::new(dispatcher)
+            };
+            if !self.merge
+                && !self.adjust_clients_only
+                && host.clients()?.iter().any(|c| {
+                    ipc::restorable(c)
+                        && self
+                            .workspace
+                            .as_ref()
+                            .is_none_or(|ws| c.workspace.matches_selector(ws))
+                })
+            {
+                return Err(hyprland::error::HyprError::Other(
+                    "Refusing to restore over existing windows; nothing was closed".into(),
+                ));
             }
             let report = run_load(&host, &plan);
-            println!("Placed {} windows, {} saved windows not matched", report.placed, report.unmatched.len());
+            println!(
+                "Placed {} windows, {} saved windows not matched",
+                report.placed,
+                report.unmatched.len()
+            );
             print_flushes(&report.flushes);
             print_verification(&report.verification);
             print_shortfalls(&report.shortfalls, &report.unmatched);
             print_surplus(&report.surplus);
+            if !report.unmatched.is_empty() || report.incomplete || host.failed() {
+                return Err(hyprland::error::HyprError::Other(
+                    "Restore was incomplete; preserving the saved snapshot".into(),
+                ));
+            }
         }
 
         println!("Finished loading session");
@@ -611,17 +741,19 @@ impl Session for LocalSession {
         self.clear_scope(Scope::All)
     }
 
-    fn list(&self) -> impl Iterator<Item=String> {
+    fn list(&self) -> impl Iterator<Item = String> {
         let paths = std::fs::read_dir(self.base_path.clone()).unwrap();
 
-        paths.filter_map(|path| {
-            let entry = path.unwrap();
-            if entry.path().is_dir() {
-                Some(entry.file_name())
-            } else {
-                None
-            }
-        }).map(|os_str| os_str.to_string_lossy().into_owned())
+        paths
+            .filter_map(|path| {
+                let entry = path.unwrap();
+                if entry.path().is_dir() {
+                    Some(entry.file_name())
+                } else {
+                    None
+                }
+            })
+            .map(|os_str| os_str.to_string_lossy().into_owned())
     }
 
     fn delete(&self, name: &str) {
@@ -635,15 +767,22 @@ impl Session for LocalSession {
 }
 #[cfg(test)]
 pub mod test_support {
-    use hyprland::data::Client;
+    use crate::ipc::Client;
 
     /// Build a synthetic client; only the fields sessions care about are parameters
-    pub fn client(class: &str, title: &str, ws: i32, floating: bool, at: (i16, i16), size: (i16, i16)) -> Client {
+    pub fn client(
+        class: &str,
+        title: &str,
+        ws: i32,
+        floating: bool,
+        at: (i32, i32),
+        size: (i32, i32),
+    ) -> Client {
         serde_json::from_value(serde_json::json!({
             "address": format!("0x{:x}", (class.len() * 1000 + title.len() * 7 + at.0 as usize) as u32),
             "at": [at.0, at.1],
             "size": [size.0, size.1],
-            "workspace": { "id": ws, "name": ws.to_string() },
+            "workspace": { "address": ws.to_string(), "id": ws, "type": "normal", "name": ws.to_string() },
             "floating": floating,
             "fullscreen": 0,
             "fullscreenClient": 0,
@@ -665,8 +804,29 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::test_support::client;
+    use super::*;
+    use crate::ipc::Workspace;
+
+    #[test]
+    fn modern_special_snapshot_preserves_address_without_numeric_id() {
+        let mut value = serde_json::to_value(SavedClient {
+            client: client("kitty", "scratchpad", 1, true, (20, 30), (640, 400)),
+            argv: Some(vec!["kitty".into()]),
+            cwd: None,
+            foreground: None,
+        })
+        .unwrap();
+        value["workspace"] = serde_json::json!({
+            "address": "special:scratchpad",
+            "type": "special",
+            "name": "Notes",
+        });
+        let decoded = serde_json::from_value::<SavedClient>(value);
+        assert!(decoded.is_ok(), "modern workspace rejected: {decoded:?}");
+        let saved = serde_json::to_value(decoded.unwrap()).unwrap();
+        assert_eq!(saved["workspace"]["address"], "special:scratchpad");
+    }
 
     #[test]
     fn test_saved_client_round_trip_with_argv_and_cwd() {
@@ -692,6 +852,7 @@ mod tests {
             simulate: true,
             load_time: 1,
             adjust_clients_only: false,
+            merge: false,
             save_duplicate_pids: false,
             dialect: Dialect::Lua,
             workspace: None,
@@ -699,14 +860,21 @@ mod tests {
     }
 
     fn scoped_session(dir: &std::path::Path, workspace: i32) -> LocalSession {
-        LocalSession { workspace: Some(workspace), ..sim_session(dir) }
+        LocalSession {
+            workspace: Some(workspace.to_string()),
+            ..sim_session(dir)
+        }
     }
 
     fn write_clients(dir: &std::path::Path, clients: &[SavedClient]) {
-        std::fs::write(dir.join(CLIENTS_PATH_NAME), serde_json::to_vec(clients).unwrap()).unwrap();
+        std::fs::write(
+            dir.join(CLIENTS_PATH_NAME),
+            serde_json::to_vec(clients).unwrap(),
+        )
+        .unwrap();
     }
 
-    fn with_argv(class: &str, argv: &[&str], ws: i32, at: (i16, i16)) -> SavedClient {
+    fn with_argv(class: &str, argv: &[&str], ws: i32, at: (i32, i32)) -> SavedClient {
         SavedClient {
             client: client(class, "t", ws, false, at, (10, 10)),
             argv: Some(argv.iter().map(|s| s.to_string()).collect()),
@@ -720,68 +888,68 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // exec.conf is stale and degraded: one bare 'brave', nothing else
         std::fs::write(dir.path().join(EXEC_NAME), "[workspace 1 silent] brave\n").unwrap();
-        write_clients(dir.path(), &[
-            with_argv("brave", &["/opt/brave/brave", "--app=https://example.test"], 5, (0, 0)),
-            with_argv("brave", &["/opt/brave/brave", "--user-data-dir=/home/x/profile two"], 1, (0, 0)),
-            with_argv("brave", &["/opt/brave/brave", "--user-data-dir=/home/x/profile two"], 1, (50, 0)),
-            with_argv("kitty", &["kitty"], 2, (0, 0)),
-        ]);
+        write_clients(
+            dir.path(),
+            &[
+                with_argv(
+                    "brave",
+                    &["/opt/brave/brave", "--app=https://example.test"],
+                    5,
+                    (0, 0),
+                ),
+                with_argv(
+                    "brave",
+                    &["/opt/brave/brave", "--user-data-dir=/home/x/profile two"],
+                    1,
+                    (0, 0),
+                ),
+                with_argv(
+                    "brave",
+                    &["/opt/brave/brave", "--user-data-dir=/home/x/profile two"],
+                    1,
+                    (50, 0),
+                ),
+                with_argv("kitty", &["kitty"], 2, (0, 0)),
+            ],
+        );
         let plan = sim_session(dir.path()).prepare_load(dir.path()).unwrap();
         assert!(plan.place_by_class);
         let commands: Vec<&str> = plan.entries.iter().map(|e| e.command.as_str()).collect();
         // Launch order: workspace ascending
-        assert_eq!(commands, vec![
-            "/opt/brave/brave '--user-data-dir=/home/x/profile two'",
-            "kitty",
-            "/opt/brave/brave --app=https://example.test",
-        ]);
+        assert_eq!(
+            commands,
+            vec![
+                "/opt/brave/brave '--user-data-dir=/home/x/profile two'",
+                "kitty",
+                "/opt/brave/brave --app=https://example.test",
+            ]
+        );
         assert!(!commands.contains(&"brave"));
     }
 
     #[test]
-    fn test_new_format_still_requires_a_valid_exec_conf() {
-        let dir = tempfile::tempdir().unwrap();
-        write_clients(dir.path(), &[with_argv("kitty", &["kitty"], 1, (0, 0))]);
-        // Missing
-        assert!(sim_session(dir.path()).prepare_load(dir.path()).is_err());
-        // Unparseable
-        std::fs::write(dir.path().join(EXEC_NAME), "[move a b] x\n").unwrap();
-        assert!(sim_session(dir.path()).prepare_load(dir.path()).is_err());
-        // Empty
-        std::fs::write(dir.path().join(EXEC_NAME), "\n").unwrap();
-        assert!(sim_session(dir.path()).prepare_load(dir.path()).is_err());
-        // Valid
-        std::fs::write(dir.path().join(EXEC_NAME), "[workspace 1 silent] kitty\n").unwrap();
-        assert!(sim_session(dir.path()).prepare_load(dir.path()).is_ok());
-    }
-
-    #[test]
-    fn test_legacy_snapshot_follows_the_exec_conf_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let exec = "[workspace 2 silent;float;move 5 6;size 7 8] kitty --title 'a b'\n[workspace 1 silent;move 0 0] brave\n";
-        std::fs::write(dir.path().join(EXEC_NAME), exec).unwrap();
-        // Old-format clients.json: windows but no argv anywhere
-        write_clients(dir.path(), &[
-            SavedClient { client: client("kitty", "t", 2, true, (5, 6), (7, 8)), argv: None, cwd: None, foreground: None },
-        ]);
-        let plan = sim_session(dir.path()).prepare_load(dir.path()).unwrap();
-        assert!(!plan.place_by_class);
-        assert!(plan.saved.is_empty());
-        assert_eq!(plan.entries, launch_order(parse_exec_conf(exec).unwrap()));
-        let commands: Vec<&str> = plan.entries.iter().map(|e| e.command.as_str()).collect();
-        assert_eq!(commands, vec!["brave", "kitty --title 'a b'"]);
-    }
-
-    #[test]
     fn test_fingerprint_ignores_address_pid_and_order_but_not_geometry() {
-        let saved = |class: &str, at: (i16, i16), pid: i32| {
+        let saved = |class: &str, at: (i32, i32), pid: i32| {
             let mut client = client(class, "t", 1, false, at, (10, 10));
             client.pid = pid;
-            SavedClient { client, argv: Some(vec![class.to_string()]), cwd: None, foreground: None }
+            SavedClient {
+                client,
+                argv: Some(vec![class.to_string()]),
+                cwd: None,
+                foreground: None,
+            }
         };
-        let before = vec![saved("brave", (0, 0), 10), saved("brave", (5, 0), 10), saved("kitty", (9, 9), 20)];
+        let before = vec![
+            saved("brave", (0, 0), 10),
+            saved("brave", (5, 0), 10),
+            saved("kitty", (9, 9), 20),
+        ];
         // After a reload: new pids, new addresses, different order
-        let mut after = vec![saved("kitty", (9, 9), 77), saved("brave", (5, 0), 55), saved("brave", (0, 0), 55)];
+        let mut after = vec![
+            saved("kitty", (9, 9), 77),
+            saved("brave", (5, 0), 55),
+            saved("brave", (0, 0), 55),
+        ];
         for (i, c) in after.iter_mut().enumerate() {
             c.client.address = hyprland::shared::Address::new(format!("0xf{i}"));
         }
@@ -793,7 +961,8 @@ mod tests {
 
     #[test]
     fn test_old_snapshot_without_new_fields_still_reads() {
-        let old = serde_json::to_string(&vec![client("kitty", "t", 1, false, (1, 2), (3, 4))]).unwrap();
+        let old =
+            serde_json::to_string(&vec![client("kitty", "t", 1, false, (1, 2), (3, 4))]).unwrap();
         let back: Vec<SavedClient> = serde_json::from_str(&old).unwrap();
         assert_eq!(back.len(), 1);
         assert!(back[0].argv.is_none() && back[0].cwd.is_none());
@@ -813,40 +982,22 @@ mod tests {
             })
             .collect();
         // Three windows of one process: one launch line, three saved windows
-        write_snapshot(dir.path(), &["[workspace 1 silent] brave".to_string()], &clients).unwrap();
-        let back: Vec<SavedClient> =
-            serde_json::from_str(&std::fs::read_to_string(dir.path().join(CLIENTS_PATH_NAME)).unwrap()).unwrap();
+        write_snapshot(
+            dir.path(),
+            &["[workspace 1 silent] brave".to_string()],
+            &clients,
+        )
+        .unwrap();
+        let back: Vec<SavedClient> = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(CLIENTS_PATH_NAME)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(back.len(), 3);
         assert_eq!(
             std::fs::read_to_string(dir.path().join(EXEC_NAME)).unwrap(),
             "[workspace 1 silent] brave\n"
         );
         assert!(!dir.path().join("exec.conf.tmp").exists());
-    }
-
-    #[test]
-    fn test_plan_adjustment_tiled_gets_workspace_only() {
-        let real = client("kitty", "term", 1, false, (0, 0), (500, 500));
-        let saved = client("kitty", "term", 4, false, (10, 20), (300, 300));
-        let ops = plan_adjustment(&real, &saved);
-        assert_eq!(ops, vec![Op::MoveToWorkspace {
-            window: real.address.clone(),
-            workspace: WorkspaceTarget::Id(4),
-        }]);
-    }
-
-    #[test]
-    fn test_plan_adjustment_floating_gets_float_move_resize() {
-        let real = client("mpv", "video", 1, false, (0, 0), (500, 500));
-        let saved = client("mpv", "video", 2, true, (10, 20), (300, 400));
-        let ops = plan_adjustment(&real, &saved);
-        let a = real.address.clone();
-        assert_eq!(ops, vec![
-            Op::MoveToWorkspace { window: a.clone(), workspace: WorkspaceTarget::Id(2) },
-            Op::Float { window: a.clone(), enable: true },
-            Op::MoveWindow { window: a.clone(), x: 10, y: 20 },
-            Op::ResizeWindow { window: a, w: 300, h: 400 },
-        ]);
     }
 
     #[test]
@@ -857,37 +1008,37 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_adjustment_named_and_anonymous_special_workspaces() {
-        let real = client("a", "t", 1, false, (0, 0), (1, 1));
-        let mut saved = client("a", "t", -98, false, (0, 0), (1, 1));
-        saved.workspace.name = "special:scratch".to_string();
-        assert_eq!(plan_adjustment(&real, &saved), vec![Op::MoveToWorkspace {
-            window: real.address.clone(),
-            workspace: WorkspaceTarget::Special("scratch".to_string()),
-        }]);
-
-        let mut anon = client("a", "t", -99, false, (0, 0), (1, 1));
-        anon.workspace.name = "special".to_string();
-        assert!(plan_adjustment(&real, &anon).is_empty());
-    }
-
-    #[test]
     fn test_scoped_load_plans_only_the_requested_workspaces_slice() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(EXEC_NAME), "[workspace 1 silent] kitty\n").unwrap();
-        let mut brave = with_argv("brave", &["/opt/brave/brave", "--profile-directory=P"], 2, (0, 0));
+        let mut brave = with_argv(
+            "brave",
+            &["/opt/brave/brave", "--profile-directory=P"],
+            2,
+            (0, 0),
+        );
         brave.client.pid = 21;
-        let mut brave_other = with_argv("brave", &["/opt/brave/brave", "--profile-directory=P"], 3, (0, 0));
+        let mut brave_other = with_argv(
+            "brave",
+            &["/opt/brave/brave", "--profile-directory=P"],
+            3,
+            (0, 0),
+        );
         brave_other.client.pid = 21;
-        write_clients(dir.path(), &[
-            with_argv("kitty", &["kitty"], 1, (0, 0)),
-            brave,
-            brave_other,
-        ]);
-        let plan = scoped_session(dir.path(), 2).prepare_load(dir.path()).unwrap();
-        assert_eq!(plan.scope, Some(2));
+        write_clients(
+            dir.path(),
+            &[
+                with_argv("kitty", &["kitty"], 1, (0, 0)),
+                brave,
+                brave_other,
+            ],
+        );
+        let plan = scoped_session(dir.path(), 2)
+            .prepare_load(dir.path())
+            .unwrap();
+        assert_eq!(plan.scope.as_deref(), Some("2"));
         assert_eq!(plan.saved.len(), 1);
-        assert_eq!(plan.saved[0].workspace.id, 2);
+        assert_eq!(plan.saved[0].workspace.selector(), "2");
         // Only the process behind workspace 2's window is launched, expecting one window
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(plan.entries[0].group.as_ref().unwrap().saved, vec![0]);
@@ -899,21 +1050,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(EXEC_NAME), "[workspace 1 silent] kitty\n").unwrap();
         write_clients(dir.path(), &[with_argv("kitty", &["kitty"], 1, (0, 0))]);
-        let err = scoped_session(dir.path(), 4).prepare_load(dir.path()).unwrap_err();
+        let err = scoped_session(dir.path(), 4)
+            .prepare_load(dir.path())
+            .unwrap_err();
         assert!(err.to_string().contains("workspace 4"), "{err}");
-    }
-
-    #[test]
-    fn test_scoped_load_of_a_legacy_snapshot_filters_launch_lines_by_workspace() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(EXEC_NAME),
-            "[workspace 1 silent;move 0 0] kitty\n[workspace 2 silent;move 0 0] brave\n",
-        ).unwrap();
-        let plan = scoped_session(dir.path(), 2).prepare_load(dir.path()).unwrap();
-        let commands: Vec<&str> = plan.entries.iter().map(|e| e.command.as_str()).collect();
-        assert_eq!(commands, vec!["brave"]);
-        assert!(scoped_session(dir.path(), 9).prepare_load(dir.path()).is_err());
     }
 
     #[test]
@@ -929,7 +1069,7 @@ mod tests {
     use crate::procfs::fake::{run_in_foreground, terminal_with_shell, FakeProc};
 
     fn terminal_window(pid: i32, workspace: i32) -> Client {
-        let mut c = client("foot", "term", workspace, false, (workspace as i16, 0), (10, 10));
+        let mut c = client("foot", "term", workspace, false, (workspace, 0), (10, 10));
         c.pid = pid;
         c
     }
@@ -950,8 +1090,15 @@ mod tests {
         run_in_foreground(&mut p, 200, &["claude"], "/home/synthetic/proj");
         let saved = capture(&p, &[terminal_window(100, 1)]);
         let fg = saved[0].foreground.as_ref().unwrap();
-        assert_eq!((fg.pid, fg.argv.clone(), fg.cwd.as_deref(), fg.linked),
-                   (200, vec!["claude".to_string()], Some("/home/synthetic/proj"), false));
+        assert_eq!(
+            (fg.pid, fg.argv.clone(), fg.cwd.as_deref(), fg.linked),
+            (
+                200,
+                vec!["claude".to_string()],
+                Some("/home/synthetic/proj"),
+                false
+            )
+        );
     }
 
     #[test]
@@ -966,7 +1113,12 @@ mod tests {
     #[test]
     fn test_saving_from_a_terminal_does_not_record_the_save_command_as_its_foreground() {
         let mut p = terminal_with_shell();
-        run_in_foreground(&mut p, 200, &["hyprsession", "save"], "/home/synthetic/proj");
+        run_in_foreground(
+            &mut p,
+            200,
+            &["hyprsession", "save"],
+            "/home/synthetic/proj",
+        );
         p.own = 200;
         let saved = capture(&p, &[terminal_window(100, 1)]);
         assert!(saved[0].foreground.is_none());
@@ -976,7 +1128,16 @@ mod tests {
     #[test]
     fn test_non_terminal_windows_get_no_foreground_and_keep_their_cwd() {
         let mut p = terminal_with_shell();
-        p.add(900, 1, 900, 900, 0, -1, &["/usr/bin/mpv"], "/home/synthetic/videos");
+        p.add(
+            900,
+            1,
+            900,
+            900,
+            0,
+            -1,
+            &["/usr/bin/mpv"],
+            "/home/synthetic/videos",
+        );
         let saved = capture(&p, &[gui_window("mpv", 900)]);
         assert!(saved[0].foreground.is_none());
         assert_eq!(saved[0].cwd.as_deref(), Some("/home/synthetic/videos"));
@@ -986,8 +1147,16 @@ mod tests {
     fn test_gui_app_started_from_a_terminal_is_linked() {
         // The playcall pattern: the terminal's foreground program IS the GUI window's process
         let mut p = terminal_with_shell();
-        run_in_foreground(&mut p, 200, &["./playcall-gui"], "/home/synthetic/Work/playcall-gui");
-        let saved = capture(&p, &[terminal_window(100, 1), gui_window("playcall-gui", 200)]);
+        run_in_foreground(
+            &mut p,
+            200,
+            &["./playcall-gui"],
+            "/home/synthetic/Work/playcall-gui",
+        );
+        let saved = capture(
+            &p,
+            &[terminal_window(100, 1), gui_window("playcall-gui", 200)],
+        );
         assert!(saved[0].foreground.as_ref().unwrap().linked);
         // And the GUI window carries no foreground of its own
         assert!(saved[1].foreground.is_none());
@@ -998,8 +1167,20 @@ mod tests {
         // The foreground leader is a shell script (pid 200); the GUI window's process (pid 201) is its child
         let mut p = terminal_with_shell();
         run_in_foreground(&mut p, 200, &["sh", "./run.sh"], "/home/synthetic/proj");
-        p.add(201, 200, 200, 101, 5, 200, &["./playcall-gui"], "/home/synthetic/proj");
-        let saved = capture(&p, &[terminal_window(100, 1), gui_window("playcall-gui", 201)]);
+        p.add(
+            201,
+            200,
+            200,
+            101,
+            5,
+            200,
+            &["./playcall-gui"],
+            "/home/synthetic/proj",
+        );
+        let saved = capture(
+            &p,
+            &[terminal_window(100, 1), gui_window("playcall-gui", 201)],
+        );
         assert!(saved[0].foreground.as_ref().unwrap().linked);
     }
 
@@ -1018,7 +1199,10 @@ mod tests {
         let mut p = terminal_with_shell();
         run_in_foreground(&mut p, 200, &["playcall-gui"], "/tmp");
         p.add(300, 1, 300, 300, 0, -1, &["playcall-gui"], "/tmp");
-        let saved = capture(&p, &[terminal_window(100, 1), gui_window("playcall-gui", 300)]);
+        let saved = capture(
+            &p,
+            &[terminal_window(100, 1), gui_window("playcall-gui", 300)],
+        );
         assert!(!saved[0].foreground.as_ref().unwrap().linked);
     }
 
@@ -1043,7 +1227,11 @@ mod tests {
         // A malformed record is treated as absent
         let broken = json.replace("\"linked\":false", "\"linked\":\"x\"");
         assert_ne!(broken, json);
-        assert!(serde_json::from_str::<Vec<SavedClient>>(&broken).unwrap()[0].foreground.is_none());
+        assert!(
+            serde_json::from_str::<Vec<SavedClient>>(&broken).unwrap()[0]
+                .foreground
+                .is_none()
+        );
     }
 
     fn terminal_snapshot(fg_argv: &[&str], linked: bool) -> SavedClient {
@@ -1062,11 +1250,22 @@ mod tests {
         saved
     }
 
-    fn plan_for(dir: &std::path::Path, clients: &[SavedClient], resume: &ResumeConfig, exists: bool) -> Vec<String> {
+    fn plan_for(
+        dir: &std::path::Path,
+        clients: &[SavedClient],
+        resume: &ResumeConfig,
+        exists: bool,
+    ) -> Vec<String> {
         write_clients(dir, clients);
         std::fs::write(dir.join(EXEC_NAME), "[workspace 1 silent] foot\n").unwrap();
         let _ = exists;
-        sim_session(dir).prepare_load_with(dir, resume).unwrap().entries.into_iter().map(|e| e.command).collect()
+        sim_session(dir)
+            .prepare_load_with(dir, resume)
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|e| e.command)
+            .collect()
     }
 
     #[test]
@@ -1081,44 +1280,38 @@ mod tests {
         let commands = plan_for(dir.path(), &[term], &ResumeConfig::default(), true);
         assert_eq!(commands.len(), 1);
         let command = &commands[0];
-        assert!(command.starts_with(&format!("cd {} && foot sh -c ", dir.path().display())), "{command}");
-        assert!(command.ends_with(&format!("hyprsession-resume {} 'claude --continue'", proj.display())), "{command}");
+        assert!(
+            command.starts_with(&format!("cd {} && foot sh -c ", dir.path().display())),
+            "{command}"
+        );
+        assert!(
+            command.ends_with(&format!(
+                "hyprsession-resume {} 'claude --continue'",
+                proj.display()
+            )),
+            "{command}"
+        );
     }
 
     #[test]
     fn test_plan_for_a_linked_terminal_is_a_plain_terminal_launch_and_the_app_launches_once() {
         let dir = tempfile::tempdir().unwrap();
-        let mut gui = SavedClient { client: gui_window("playcall-gui", 200), argv: Some(vec!["./playcall-gui".into()]), cwd: None, foreground: None };
-        gui.client.workspace.id = 1;
+        let mut gui = SavedClient {
+            client: gui_window("playcall-gui", 200),
+            argv: Some(vec!["./playcall-gui".into()]),
+            cwd: None,
+            foreground: None,
+        };
+        gui.client.workspace = Workspace::numbered(1);
         let mut term = terminal_snapshot(&["./playcall-gui"], true);
         term.cwd = None;
         let commands = plan_for(dir.path(), &[term, gui], &ResumeConfig::default(), true);
         let mut sorted = commands.clone();
         sorted.sort();
-        assert_eq!(sorted, vec!["./playcall-gui".to_string(), "foot".to_string()]);
-    }
-
-    #[test]
-    fn test_plan_follows_the_unlisted_policy_and_user_overrides() {
-        let dir = tempfile::tempdir().unwrap();
-        let proj = dir.path().join("p");
-        std::fs::create_dir(&proj).unwrap();
-        let mk = |argv: &[&str]| {
-            let mut t = terminal_snapshot(argv, false);
-            t.cwd = None;
-            t.foreground.as_mut().unwrap().cwd = Some(proj.to_str().unwrap().to_string());
-            t
-        };
-        // Unlisted, default policy: replay verbatim
-        let c = plan_for(dir.path(), &[mk(&["htop", "-d", "5"])], &ResumeConfig::default(), true);
-        assert!(c[0].ends_with("'htop -d 5'"), "{}", c[0]);
-        // Unlisted, prompt policy: clean prompt
-        let prompt = ResumeConfig::parse("[settings]\nunlisted = \"prompt\"\n", "t").unwrap();
-        assert_eq!(plan_for(dir.path(), &[mk(&["htop"])], &prompt, true), vec!["foot".to_string()]);
-        // A user entry overrides a built-in one
-        let over = ResumeConfig::parse("[resume]\nclaude = \"claude --resume-session x\"\n", "t").unwrap();
-        let c = plan_for(dir.path(), &[mk(&["claude"])], &over, true);
-        assert!(c[0].ends_with("'claude --resume-session x'"), "{}", c[0]);
+        assert_eq!(
+            sorted,
+            vec!["./playcall-gui".to_string(), "foot".to_string()]
+        );
     }
 
     #[test]
@@ -1128,7 +1321,10 @@ mod tests {
         t.argv = Some(vec!["myterm".into()]);
         t.cwd = None;
         let config = ResumeConfig::parse("[terminals]\nextra = [\"myterm\"]\n", "t").unwrap();
-        assert_eq!(plan_for(dir.path(), &[t], &config, true), vec!["myterm".to_string()]);
+        assert_eq!(
+            plan_for(dir.path(), &[t], &config, true),
+            vec!["myterm".to_string()]
+        );
     }
 
     #[test]
@@ -1137,13 +1333,10 @@ mod tests {
         let mut plain = terminal_snapshot(&["x"], false);
         plain.foreground = None;
         plain.cwd = None;
-        assert_eq!(plan_for(dir.path(), &[plain], &ResumeConfig::default(), true), vec!["foot".to_string()]);
-    }
-
-    #[test]
-    fn test_a_bad_resume_file_fails_the_plan_before_anything_is_touched() {
-        let err = ResumeConfig::parse("[settings]\nunlisted = 3\n", "/c/resume.toml").unwrap_err();
-        assert!(err.contains("/c/resume.toml:2"), "{err}");
+        assert_eq!(
+            plan_for(dir.path(), &[plain], &ResumeConfig::default(), true),
+            vec!["foot".to_string()]
+        );
     }
 
     /// The process tree the compositor shows for a terminal launched with `command` (a planned
@@ -1153,10 +1346,23 @@ mod tests {
     fn wrapped_terminal_tree(command: &str, cwd: &str, program: &[&str]) -> FakeProc {
         // the launch may be prefixed with `cd <dir> &&`; the process tree starts at the terminal
         let words = shell_words(&command[command.find("foot").unwrap()..]);
-        let terminal_argv: Vec<&str> = words.iter().skip_while(|w| *w != "foot").map(String::as_str).collect();
+        let terminal_argv: Vec<&str> = words
+            .iter()
+            .skip_while(|w| *w != "foot")
+            .map(String::as_str)
+            .collect();
         let mut p = FakeProc::default();
         p.add(1, 0, 1, 1, 0, -1, &["init"], "/");
-        p.add(500, 1, 500, 500, 0, -1, &terminal_argv, "/home/synthetic/shell-dir");
+        p.add(
+            500,
+            1,
+            500,
+            500,
+            0,
+            -1,
+            &terminal_argv,
+            "/home/synthetic/shell-dir",
+        );
         p.add(501, 500, 501, 501, 9, 501, &terminal_argv[1..], cwd);
         p.add(502, 501, 501, 501, 9, 501, program, cwd);
         p
@@ -1179,8 +1385,15 @@ mod tests {
 
         // Save: the probe sees only "the shell" (no foreground group), yet the resume is recorded
         let save = SavedClient::capture_all(&[terminal_window(500, 1)], &tree, &resume);
-        assert_eq!(save[0].argv, Some(vec!["foot".to_string()]), "the terminal itself, never the wrapper");
-        let fg = save[0].foreground.as_ref().expect("wrapper terminal must record a foreground");
+        assert_eq!(
+            save[0].argv,
+            Some(vec!["foot".to_string()]),
+            "the terminal itself, never the wrapper"
+        );
+        let fg = save[0]
+            .foreground
+            .as_ref()
+            .expect("wrapper terminal must record a foreground");
         assert_eq!(fg.argv, vec!["claude", "--continue"]);
         assert_eq!(fg.cwd.as_deref(), Some(proj));
         assert!(!fg.linked);
@@ -1203,7 +1416,24 @@ mod tests {
         let resume = ResumeConfig::default();
         let mut p = FakeProc::default();
         p.add(1, 0, 1, 1, 0, -1, &["init"], "/");
-        p.add(500, 1, 500, 500, 0, -1, &["foot", "sh", "-c", "s", "hyprsession-resume", "/p", "claude --continue"], "/");
+        p.add(
+            500,
+            1,
+            500,
+            500,
+            0,
+            -1,
+            &[
+                "foot",
+                "sh",
+                "-c",
+                "s",
+                "hyprsession-resume",
+                "/p",
+                "claude --continue",
+            ],
+            "/",
+        );
         p.add(501, 500, 501, 501, 9, 501, &["-zsh"], "/p");
         let save = SavedClient::capture_all(&[terminal_window(500, 1)], &p, &resume);
         assert_eq!(save[0].foreground, None);
@@ -1217,22 +1447,64 @@ mod tests {
         let mut p = FakeProc::default();
         p.add(1, 0, 1, 1, 0, -1, &["init"], "/");
         p.add(500, 1, 500, 500, 0, -1, &["foot"], "/");
-        p.add(501, 500, 501, 501, 9, 501, &["sh", "-c", "s", "hyprsession-resume", "/p", "hyprsession save x"], "/p");
-        p.add(502, 501, 501, 501, 9, 501, &["hyprsession", "save", "x"], "/p");
+        p.add(
+            501,
+            500,
+            501,
+            501,
+            9,
+            501,
+            &[
+                "sh",
+                "-c",
+                "s",
+                "hyprsession-resume",
+                "/p",
+                "hyprsession save x",
+            ],
+            "/p",
+        );
+        p.add(
+            502,
+            501,
+            501,
+            501,
+            9,
+            501,
+            &["hyprsession", "save", "x"],
+            "/p",
+        );
         p.own = 502;
-        assert_eq!(SavedClient::capture_all(&[terminal_window(500, 1)], &p, &resume)[0].foreground, None);
+        assert_eq!(
+            SavedClient::capture_all(&[terminal_window(500, 1)], &p, &resume)[0].foreground,
+            None
+        );
         // two shells in one terminal process: ambiguous, nothing recorded
         let mut p = FakeProc::default();
         p.add(1, 0, 1, 1, 0, -1, &["init"], "/");
         p.add(500, 1, 500, 500, 0, -1, &["foot"], "/");
-        p.add(501, 500, 501, 501, 9, 501, &["sh", "-c", "s", "hyprsession-resume", "/p", "claude"], "/p");
+        p.add(
+            501,
+            500,
+            501,
+            501,
+            9,
+            501,
+            &["sh", "-c", "s", "hyprsession-resume", "/p", "claude"],
+            "/p",
+        );
         p.add(503, 500, 503, 503, 10, 503, &["-zsh"], "/p");
-        assert_eq!(SavedClient::capture_all(&[terminal_window(500, 1)], &p, &resume)[0].foreground, None);
+        assert_eq!(
+            SavedClient::capture_all(&[terminal_window(500, 1)], &p, &resume)[0].foreground,
+            None
+        );
         // a resumed program that owns another saved window is linked, not relaunched in the terminal
-        let mut p = wrapped_terminal_tree("foot sh -c s hyprsession-resume /p brave", "/p", &["brave"]);
+        let mut p =
+            wrapped_terminal_tree("foot sh -c s hyprsession-resume /p brave", "/p", &["brave"]);
         p.procs.get_mut(&502).unwrap().stat.pgrp = 501;
         let mut browser = terminal_window(502, 2);
-        browser.class = "brave".into(); browser.initial_class = "brave".into();
+        browser.class = "brave".into();
+        browser.initial_class = "brave".into();
         let save = SavedClient::capture_all(&[terminal_window(500, 1), browser], &p, &resume);
         assert!(save[0].foreground.as_ref().unwrap().linked);
     }
@@ -1257,10 +1529,32 @@ mod tests {
         let words: Vec<String> = shell_words(&command);
         let mut after_proc = FakeProc::default();
         after_proc.add(1, 0, 1, 1, 0, -1, &["init"], "/");
-        let terminal_argv: Vec<&str> = words.iter().skip_while(|w| *w != "foot").map(String::as_str).collect();
-        after_proc.add(500, 1, 500, 500, 0, -1, &terminal_argv, "/home/synthetic/shell-dir");
+        let terminal_argv: Vec<&str> = words
+            .iter()
+            .skip_while(|w| *w != "foot")
+            .map(String::as_str)
+            .collect();
+        after_proc.add(
+            500,
+            1,
+            500,
+            500,
+            0,
+            -1,
+            &terminal_argv,
+            "/home/synthetic/shell-dir",
+        );
         after_proc.add(501, 500, 501, 501, 9, 502, &["sh"], proj.to_str().unwrap());
-        after_proc.add(502, 501, 502, 501, 9, 502, &["claude", "--continue"], proj.to_str().unwrap());
+        after_proc.add(
+            502,
+            501,
+            502,
+            501,
+            9,
+            502,
+            &["claude", "--continue"],
+            proj.to_str().unwrap(),
+        );
         let save2 = SavedClient::capture_all(&[terminal_window(500, 1)], &after_proc, &resume);
 
         // The terminal's recorded argv is its own again, never the wrapper
